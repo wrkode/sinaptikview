@@ -1,13 +1,22 @@
 {
-    "name": "sakai-vue",
-    "version": "4.3.0",
+    "name": "sinaptikview",
+    "version": "1.0.0",
+    "description": "A lightweight, modern dashboard for Kubernetes cluster management",
+    "author": "wrkode",
+    "license": "Apache-2.0",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/wrkode/sinaptikview.git"
+    },
     "scripts": {
         "dev:frontend": "vite",
         "dev:backend": "node server/server.js",
         "dev": "concurrently \"npm:dev:frontend\" \"npm:dev:backend\"",
+        "backend": "node server/server.js",
         "build": "vite build",
         "preview": "vite preview",
-        "lint": "eslint --fix . --ext .vue,.js,.jsx,.cjs,.mjs --fix --ignore-path .gitignore"
+        "lint": "eslint --fix . --ext .vue,.js,.jsx,.cjs,.mjs --fix --ignore-path .gitignore",
+        "start": "node server/server.js"
     },
     "dependencies": {
         "@primeuix/themes": "^1.0.0",
@@ -35,5 +44,14 @@
         "tailwindcss": "^3.4.6",
         "unplugin-vue-components": "^0.27.3",
         "vite": "^5.3.1"
-    }
+    },
+    "keywords": [
+        "kubernetes",
+        "dashboard",
+        "vue",
+        "primevue",
+        "k8s",
+        "cluster",
+        "management"
+    ]
 }

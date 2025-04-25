@@ -1,7 +1,14 @@
 <script setup>
 import { ref } from 'vue';
 
-import AppMenuItem from './AppMenuItem.vue';
+
+// Track which sections are expanded/collapsed
+const expandedSections = ref({});
+
+// Toggle the expansion state of a section
+const toggleSection = (index) => {
+  expandedSections.value[index] = !expandedSections.value[index];
+};
 
 // Define the new menu structure
 const model = ref([
@@ -64,7 +71,7 @@ const model = ref([
     },
     {
         label: 'Storage',
-        icon: 'pi pi-fw pi-hdd', 
+        icon: 'pi pi-fw pi-database', 
         items: [
             {
                 label: 'Persistent Volume Claims',
@@ -151,11 +158,109 @@ const model = ref([
 
 <template>
     <ul class="layout-menu">
-        <template v-for="(item, i) in model" :key="item">
-            <app-menu-item v-if="!item.separator" :item="item" :index="i"></app-menu-item>
-            <li v-if="item.separator" class="menu-separator"></li>
-        </template>
+        <li v-for="(item, i) in model" :key="i" class="menu-category">
+            <div class="menu-header" @click="toggleSection(i)">
+                <i :class="item.icon" class="menu-icon"></i>
+                <span class="menu-category-label">{{ item.label }}</span>
+                <i :class="expandedSections[i] ? 'pi pi-chevron-down' : 'pi pi-chevron-right'" class="menu-toggle-icon"></i>
+            </div>
+            <Transition name="menu-slide">
+                <ul v-show="expandedSections[i]" class="menu-items">
+                    <li v-for="(subitem, j) in item.items" :key="j" class="menu-item">
+                        <router-link :to="subitem.to" class="menu-link">
+                            <i :class="subitem.icon" class="menu-item-icon"></i>
+                            <span class="menu-item-text">{{ subitem.label }}</span>
+                        </router-link>
+                    </li>
+                </ul>
+            </Transition>
+        </li>
     </ul>
 </template>
 
-<style lang="scss" scoped></style>
+<style lang="scss" scoped>
+.layout-menu {
+    padding: 0;
+    margin: 0;
+    list-style-type: none;
+}
+
+.menu-category {
+    margin-bottom: 0.5rem;
+}
+
+.menu-header {
+    display: flex;
+    align-items: center;
+    padding: 0.5rem 1rem;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: background-color 0.2s;
+    
+    &:hover {
+        background-color: rgba(0, 0, 0, 0.05);
+    }
+}
+
+.menu-icon {
+    margin-right: 0.5rem;
+}
+
+.menu-category-label {
+    flex: 1;
+    font-weight: 600;
+}
+
+.menu-toggle-icon {
+    font-size: 0.875rem;
+    transition: transform 0.2s;
+}
+
+.menu-items {
+    padding-left: 1rem;
+    overflow: hidden;
+    list-style-type: none;
+}
+
+.menu-item {
+    margin: 0.3rem 0;
+}
+
+.menu-link {
+    display: flex;
+    align-items: center;
+    padding: 0.5rem 1rem;
+    color: inherit;
+    text-decoration: none;
+    border-radius: 4px;
+    transition: background-color 0.2s;
+    
+    &:hover {
+        background-color: rgba(0, 0, 0, 0.05);
+    }
+    
+    &.router-link-active {
+        background-color: var(--primary-color, #3B82F6);
+        color: var(--primary-color-text, white);
+    }
+}
+
+.menu-item-icon {
+    margin-right: 0.5rem;
+}
+
+// Transition for menu items
+.menu-slide-enter-active,
+.menu-slide-leave-active {
+    transition: max-height 0.3s ease, opacity 0.2s ease;
+    max-height: 1000px;
+    opacity: 1;
+    overflow: hidden;
+}
+
+.menu-slide-enter-from,
+.menu-slide-leave-to {
+    max-height: 0;
+    opacity: 0;
+}
+</style>

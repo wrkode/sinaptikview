@@ -278,7 +278,17 @@ app.get('/api/v1/namespaces/:namespace/events', async (req, res) => {
             options.fieldSelector = fieldSelector;
         }
         
-        const eventRes = await k8sApi.listNamespacedEvent(options);
+        let eventRes;
+        if (namespace === 'all') {
+            console.log('Listing events for all namespaces...');
+            // Use listEventForAllNamespaces for 'all' namespace
+            eventRes = await k8sApi.listEventForAllNamespaces();
+            console.log(`All namespaces events count:`, eventRes?.body?.items?.length || 0);
+        } else {
+            console.log(`Listing events for namespace: ${namespace}...`);
+            eventRes = await k8sApi.listNamespacedEvent(options);
+        }
+        
         console.log(`Events response keys for ${namespace}:`, eventRes ? Object.keys(eventRes) : 'No response');
 
         if (eventRes && eventRes.body && eventRes.body.items) {
