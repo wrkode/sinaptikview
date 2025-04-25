@@ -1,7 +1,7 @@
 # SynaptikView - Modern Kubernetes Dashboard
 
 <div align="center">
-  <img src="public/logo.png" alt="SynaptikView Logo" width="200"/>
+  <img src="public/screenshot.png" alt="SynaptikView Screenshot" width="600"/>
   <p>A lightweight, modern dashboard for Kubernetes cluster management</p>
 </div>
 
@@ -102,10 +102,6 @@ sinaptikview/
 │   └── main.js       # Application entry point
 └── package.json      # Dependencies and scripts
 ```
-
-## Screenshots
-
-*Add your application screenshots here*
 
 ## Contributing
 
