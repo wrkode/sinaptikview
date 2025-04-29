@@ -1347,34 +1347,65 @@ app.get('/api/cluster-api/management-cluster', async (req, res) => {
       return res.json(cachedData);
     }
     
-    const k8sClient = kc.makeApiClient(k8s.CoreV1Api);
+    // Since kubectl works but the K8s client doesn't, use kubectl directly
+    const { exec } = require('child_process');
     
-    // Get namespaces for context
-    let namespaces = [];
+    // Use Promise to handle the async exec call
+    const execKubectl = () => {
+      return new Promise((resolve, reject) => {
+        exec('kubectl -n kcm-system get clusters -o json', (error, stdout, stderr) => {
+          if (error) {
+            console.log('kubectl error:', error);
+            reject(error);
+            return;
+          }
+          
+          try {
+            const result = JSON.parse(stdout);
+            console.log('kubectl found clusters for tree:', result.items?.length || 0);
+            resolve(result.items || []);
+          } catch (parseErr) {
+            console.log('Failed to parse kubectl output for tree:', parseErr.message);
+            reject(parseErr);
+          }
+        });
+      });
+    };
+    
     try {
-      const namespacesResponse = await k8sClient.listNamespace();
-      // Added safe access with optional chaining and fallback to empty array
-      namespaces = namespacesResponse?.body?.items || [];
-    } catch (err) {
-      console.warn('Error fetching namespaces:', err.message);
-      // Continue with empty namespaces array
-    }
-    
-    // Get clusters using Custom Resources API
-    const customObjectsApi = kc.makeApiClient(k8s.CustomObjectsApi);
-    
-    let clustersResponse;
-    try {
-      clustersResponse = await customObjectsApi.listClusterCustomObject(
-        'cluster.x-k8s.io', 
-        'v1beta1', 
-        'clusters'
-      );
-    } catch (err) {
-      // Handle the case where Cluster API CRDs are not installed
-      console.warn('Failed to fetch Cluster API resources, they may not be installed:', err.message);
+      // Get the clusters using kubectl
+      const clusters = await execKubectl();
       
-      // Return a simple management node without clusters
+      console.log(`Building tree with ${clusters.length} clusters from kubectl`);
+      
+      // Construct the tree structure more efficiently
+      const managementClusterNode = {
+        name: 'Management',
+        isManagement: true,
+        namespace: '',
+        infrastructureProvider: 'Unknown',
+        children: clusters.map(cluster => {
+          const clusterNode = {
+            name: cluster.metadata?.name || 'Unnamed',
+            namespace: cluster.metadata?.namespace || 'default',
+            phase: cluster.status?.phase || 'Unknown',
+            infrastructureProvider: cluster.spec?.infrastructureRef?.kind || 'Unknown',
+            isManagement: false
+          };
+          console.log(`Added cluster node: ${clusterNode.name} in ${clusterNode.namespace} with provider ${clusterNode.infrastructureProvider}`);
+          return clusterNode;
+        })
+      };
+      
+      // Store in cache with 60s TTL for management cluster
+      apiCache.set(cacheKey, managementClusterNode);
+      apiCache.setMaxAge(cacheKey, 60000); // 60 seconds
+      
+      res.json(managementClusterNode);
+    } catch (kubectlErr) {
+      console.error('Error executing kubectl for tree:', kubectlErr);
+      
+      // Fallback to empty response
       const emptyResponse = {
         name: 'Management',
         isManagement: true,
@@ -1383,36 +1414,12 @@ app.get('/api/cluster-api/management-cluster', async (req, res) => {
         children: []
       };
       
-      // Cache empty response too, but for a shorter time (10 seconds)
+      // Cache empty response for a short time
       apiCache.set(cacheKey, emptyResponse);
       apiCache.setMaxAge(cacheKey, 10000); // 10 seconds
       
-      return res.json(emptyResponse);
+      res.json(emptyResponse);
     }
-    
-    // Added safe access with optional chaining and fallback to empty array
-    const clusters = clustersResponse?.body?.items || [];
-    
-    // Construct the tree structure more efficiently
-    const managementClusterNode = {
-      name: 'Management',
-      isManagement: true,
-      namespace: '',
-      infrastructureProvider: 'Unknown',
-      children: clusters.map(cluster => ({
-        name: cluster.metadata?.name || 'Unnamed',
-        namespace: cluster.metadata?.namespace || 'default',
-        phase: cluster.status?.phase || 'Unknown',
-        infrastructureProvider: cluster.spec?.infrastructureRef?.kind || 'Unknown',
-        isManagement: false
-      }))
-    };
-    
-    // Store in cache with 60s TTL for management cluster
-    apiCache.set(cacheKey, managementClusterNode);
-    apiCache.setMaxAge(cacheKey, 60000); // 60 seconds
-    
-    res.json(managementClusterNode);
   } catch (err) {
     console.error('Error fetching management cluster tree:', err);
     res.status(500).json({ 
@@ -1436,21 +1443,52 @@ app.get('/api/cluster-api/workload-clusters', async (req, res) => {
       return res.json(cachedData);
     }
     
-    // Get clusters using Custom Resources API
-    const customObjectsApi = kc.makeApiClient(k8s.CustomObjectsApi);
+    // Since kubectl works but the K8s client doesn't, use kubectl directly
+    const { exec } = require('child_process');
     
-    let response;
+    // Use Promise to handle the async exec call
+    const execKubectl = () => {
+      return new Promise((resolve, reject) => {
+        exec('kubectl -n kcm-system get clusters -o json', (error, stdout, stderr) => {
+          console.log('kubectl stderr:', stderr);
+          if (error) {
+            console.log('kubectl error:', error);
+            reject(error);
+            return;
+          }
+          
+          try {
+            const result = JSON.parse(stdout);
+            console.log('kubectl found clusters:', result.items?.length || 0);
+            
+            if (result.items && result.items.length > 0) {
+              console.log('First cluster from kubectl:', result.items[0].metadata.name, 'in', result.items[0].metadata.namespace);
+            }
+            
+            resolve(result);
+          } catch (parseErr) {
+            console.log('Failed to parse kubectl output:', parseErr.message);
+            reject(parseErr);
+          }
+        });
+      });
+    };
+    
     try {
-      response = await customObjectsApi.listClusterCustomObject(
-        'cluster.x-k8s.io', 
-        'v1beta1', 
-        'clusters'
-      );
-    } catch (err) {
-      // Handle the case where Cluster API CRDs are not installed
-      console.warn('Failed to fetch Cluster API resources, they may not be installed:', err.message);
+      // Get the clusters using kubectl
+      const clusterList = await execKubectl();
       
-      // Return empty list
+      console.log(`Successfully fetched ${clusterList.items?.length || 0} clusters using kubectl`);
+      
+      // Cache the result with 45s TTL
+      apiCache.set(cacheKey, clusterList);
+      apiCache.setMaxAge(cacheKey, 45000); // 45 seconds
+      
+      res.json(clusterList);
+    } catch (kubectlErr) {
+      console.error('Error executing kubectl:', kubectlErr);
+      
+      // Fallback to empty response
       const emptyResponse = { 
         kind: 'ClusterList',
         apiVersion: 'cluster.x-k8s.io/v1beta1',
@@ -1461,14 +1499,8 @@ app.get('/api/cluster-api/workload-clusters', async (req, res) => {
       apiCache.set(cacheKey, emptyResponse);
       apiCache.setMaxAge(cacheKey, 10000); // 10 seconds for empty results
       
-      return res.json(emptyResponse);
+      res.json(emptyResponse);
     }
-    
-    // Store in cache with 45s TTL
-    apiCache.set(cacheKey, response.body);
-    apiCache.setMaxAge(cacheKey, 45000); // 45 seconds
-    
-    res.json(response.body);
   } catch (err) {
     console.error('Error fetching workload clusters:', err);
     res.status(500).json({ 
@@ -1493,21 +1525,46 @@ app.get('/api/cluster-api/clusters/:namespace/:name', async (req, res) => {
       return res.json(cachedData);
     }
     
-    // Get cluster using Custom Resources API
-    const customObjectsApi = kc.makeApiClient(k8s.CustomObjectsApi);
-    const response = await customObjectsApi.getNamespacedCustomObject(
-      'cluster.x-k8s.io', 
-      'v1beta1', 
-      namespace,
-      'clusters',
-      name
-    );
+    // Use kubectl directly as it's working better than the K8s client
+    const { exec } = require('child_process');
     
-    // Cache the result with 60s TTL
-    apiCache.set(cacheKey, response.body);
-    apiCache.setMaxAge(cacheKey, 60000); // 60 seconds
+    const execKubectl = () => {
+      return new Promise((resolve, reject) => {
+        exec(`kubectl -n ${namespace} get cluster ${name} -o json`, (error, stdout, stderr) => {
+          if (error) {
+            console.log(`kubectl error for cluster ${namespace}/${name}:`, error);
+            reject(error);
+            return;
+          }
+          
+          try {
+            const result = JSON.parse(stdout);
+            console.log(`kubectl successfully fetched cluster ${namespace}/${name}`);
+            resolve(result);
+          } catch (parseErr) {
+            console.log(`Failed to parse kubectl output for cluster ${namespace}/${name}:`, parseErr.message);
+            reject(parseErr);
+          }
+        });
+      });
+    };
     
-    res.json(response.body);
+    try {
+      // Get the cluster using kubectl
+      const cluster = await execKubectl();
+      
+      // Cache the result with 60s TTL
+      apiCache.set(cacheKey, cluster);
+      apiCache.setMaxAge(cacheKey, 60000); // 60 seconds
+      
+      res.json(cluster);
+    } catch (kubectlErr) {
+      console.error(`Error executing kubectl for cluster ${namespace}/${name}:`, kubectlErr);
+      res.status(404).json({ 
+        error: 'Failed to fetch cluster details', 
+        message: `Cluster ${namespace}/${name} not found` 
+      });
+    }
   } catch (err) {
     console.error(`Error fetching cluster ${req.params.namespace}/${req.params.name}:`, err);
     res.status(500).json({ 
@@ -1532,33 +1589,52 @@ app.get('/api/cluster-api/clusters/:namespace/:name/machines', async (req, res) 
       return res.json(cachedData);
     }
     
-    // Get machines using Custom Resources API
-    const customObjectsApi = kc.makeApiClient(k8s.CustomObjectsApi);
-    const response = await customObjectsApi.listNamespacedCustomObject(
-      'cluster.x-k8s.io', 
-      'v1beta1', 
-      namespace,
-      'machines'
-    );
+    // Use kubectl directly as it's working better than the K8s client
+    const { exec } = require('child_process');
     
-    // Filter machines that belong to this cluster
-    const allMachines = response.body?.items || [];
-    const clusterMachines = allMachines.filter(machine => {
-      const clusterName = machine.metadata?.labels?.['cluster.x-k8s.io/cluster-name'];
-      return clusterName === name;
-    });
-    
-    const machineList = {
-      kind: 'MachineList',
-      apiVersion: 'cluster.x-k8s.io/v1beta1',
-      items: clusterMachines
+    const execKubectl = () => {
+      return new Promise((resolve, reject) => {
+        // Using a selector to find machines that belong to this cluster
+        exec(`kubectl -n ${namespace} get machines --selector=cluster.x-k8s.io/cluster-name=${name} -o json`, (error, stdout, stderr) => {
+          if (error) {
+            console.log(`kubectl error for machines of ${namespace}/${name}:`, error);
+            reject(error);
+            return;
+          }
+          
+          try {
+            const result = JSON.parse(stdout);
+            console.log(`kubectl found ${result.items?.length || 0} machines for cluster ${namespace}/${name}`);
+            resolve(result);
+          } catch (parseErr) {
+            console.log(`Failed to parse kubectl output for machines of ${namespace}/${name}:`, parseErr.message);
+            reject(parseErr);
+          }
+        });
+      });
     };
     
-    // Cache the result with 30s TTL
-    apiCache.set(cacheKey, machineList);
-    apiCache.setMaxAge(cacheKey, 30000); // 30 seconds
-    
-    res.json(machineList);
+    try {
+      // Get the machines using kubectl
+      const machineList = await execKubectl();
+      
+      // Cache the result with 30s TTL
+      apiCache.set(cacheKey, machineList);
+      apiCache.setMaxAge(cacheKey, 30000); // 30 seconds
+      
+      res.json(machineList);
+    } catch (kubectlErr) {
+      console.error(`Error executing kubectl for machines of ${namespace}/${name}:`, kubectlErr);
+      
+      // Return empty list on error
+      const emptyResponse = {
+        kind: 'MachineList',
+        apiVersion: 'cluster.x-k8s.io/v1beta1',
+        items: []
+      };
+      
+      res.json(emptyResponse);
+    }
   } catch (err) {
     console.error(`Error fetching machines for cluster ${req.params.namespace}/${req.params.name}:`, err);
     res.status(500).json({ 

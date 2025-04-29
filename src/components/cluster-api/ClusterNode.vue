@@ -57,17 +57,23 @@ const props = defineProps({
 const router = useRouter();
 
 const getProviderIcon = (provider) => {
-  switch (provider) {
-    case 'AzureCluster':
-      return 'pi pi-microsoft';
-    case 'DockerCluster':
-      return 'pi pi-server';
-    case 'GCPCluster':
-      return 'pi pi-google';
-    case 'AWSCluster':
-      return 'pi pi-amazon';
-    default:
-      return 'pi pi-cloud';
+  if (!provider) return 'pi pi-cloud';
+  
+  // Use includes/startsWith for more flexible matching
+  if (provider.includes('Azure') || provider.includes('azure')) {
+    return 'pi pi-microsoft';
+  } else if (provider.includes('Docker') || provider.includes('docker')) {
+    return 'pi pi-server';
+  } else if (provider.includes('GCP') || provider.includes('gcp')) {
+    return 'pi pi-google';
+  } else if (provider.includes('AWS') || provider.includes('aws')) {
+    return 'pi pi-amazon';
+  } else if (provider.includes('VSphere') || provider.includes('vsphere')) {
+    return 'pi pi-desktop';
+  } else if (provider.includes('OpenStack') || provider.includes('openstack')) {
+    return 'pi pi-cloud-upload';
+  } else {
+    return 'pi pi-cloud';
   }
 };
 
