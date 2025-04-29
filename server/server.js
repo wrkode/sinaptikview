@@ -12,6 +12,59 @@ kc.loadFromDefault();
 const k8sApi = kc.makeApiClient(k8s.CoreV1Api);
 const k8sAppsApi = kc.makeApiClient(k8s.AppsV1Api); // Add AppsV1Api client
 
+// Add a simple cache system
+const apiCache = {
+  data: {},
+  timestamps: {},
+  maxAge: 30000, // 30 seconds cache TTL
+  
+  // Store data in cache
+  set(key, data) {
+    this.data[key] = data;
+    this.timestamps[key] = Date.now();
+  },
+  
+  // Get data from cache if it's still valid
+  get(key) {
+    const timestamp = this.timestamps[key];
+    if (timestamp && (Date.now() - timestamp < this.maxAge)) {
+      return this.data[key];
+    }
+    return null;
+  },
+  
+  // Clear specific cache entry
+  clear(key) {
+    delete this.data[key];
+    delete this.timestamps[key];
+  },
+  
+  // Clear all cache
+  clearAll() {
+    this.data = {};
+    this.timestamps = {};
+  },
+  
+  // Set TTL for a specific key
+  setMaxAge(key, ttl) {
+    if (this.data[key]) {
+      // Create a special field for key-specific TTL
+      this.data[key]._ttl = ttl;
+    }
+  },
+  
+  // Check if cached data is valid with potential custom TTL
+  isValid(key) {
+    const timestamp = this.timestamps[key];
+    if (!timestamp) return false;
+    
+    const data = this.data[key];
+    const ttl = data && data._ttl ? data._ttl : this.maxAge;
+    
+    return Date.now() - timestamp < ttl;
+  }
+};
+
 app.get('/', (req, res) => {
   res.send('Kubernetes Dashboard Backend is running!');
 });
@@ -1278,6 +1331,241 @@ app.get('/api/v1/namespaces/:namespace/poddisruptionbudgets/:name', async (req, 
             res.status(500).json({ error: 'Failed to fetch pod disruption budget details', details: err.message });
         }
     }
+});
+
+// API endpoint for Cluster API management cluster tree (with caching)
+app.get('/api/cluster-api/management-cluster', async (req, res) => {
+  try {
+    console.log('Fetching Cluster API management cluster tree');
+    
+    // Check cache first
+    const cacheKey = 'management-cluster-tree';
+    const cachedData = apiCache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('Returning cached management cluster tree');
+      return res.json(cachedData);
+    }
+    
+    const k8sClient = kc.makeApiClient(k8s.CoreV1Api);
+    
+    // Get namespaces for context
+    let namespaces = [];
+    try {
+      const namespacesResponse = await k8sClient.listNamespace();
+      // Added safe access with optional chaining and fallback to empty array
+      namespaces = namespacesResponse?.body?.items || [];
+    } catch (err) {
+      console.warn('Error fetching namespaces:', err.message);
+      // Continue with empty namespaces array
+    }
+    
+    // Get clusters using Custom Resources API
+    const customObjectsApi = kc.makeApiClient(k8s.CustomObjectsApi);
+    
+    let clustersResponse;
+    try {
+      clustersResponse = await customObjectsApi.listClusterCustomObject(
+        'cluster.x-k8s.io', 
+        'v1beta1', 
+        'clusters'
+      );
+    } catch (err) {
+      // Handle the case where Cluster API CRDs are not installed
+      console.warn('Failed to fetch Cluster API resources, they may not be installed:', err.message);
+      
+      // Return a simple management node without clusters
+      const emptyResponse = {
+        name: 'Management',
+        isManagement: true,
+        namespace: '',
+        infrastructureProvider: 'Unknown',
+        children: []
+      };
+      
+      // Cache empty response too, but for a shorter time (10 seconds)
+      apiCache.set(cacheKey, emptyResponse);
+      apiCache.setMaxAge(cacheKey, 10000); // 10 seconds
+      
+      return res.json(emptyResponse);
+    }
+    
+    // Added safe access with optional chaining and fallback to empty array
+    const clusters = clustersResponse?.body?.items || [];
+    
+    // Construct the tree structure more efficiently
+    const managementClusterNode = {
+      name: 'Management',
+      isManagement: true,
+      namespace: '',
+      infrastructureProvider: 'Unknown',
+      children: clusters.map(cluster => ({
+        name: cluster.metadata?.name || 'Unnamed',
+        namespace: cluster.metadata?.namespace || 'default',
+        phase: cluster.status?.phase || 'Unknown',
+        infrastructureProvider: cluster.spec?.infrastructureRef?.kind || 'Unknown',
+        isManagement: false
+      }))
+    };
+    
+    // Store in cache with 60s TTL for management cluster
+    apiCache.set(cacheKey, managementClusterNode);
+    apiCache.setMaxAge(cacheKey, 60000); // 60 seconds
+    
+    res.json(managementClusterNode);
+  } catch (err) {
+    console.error('Error fetching management cluster tree:', err);
+    res.status(500).json({ 
+      error: 'Failed to fetch management cluster tree', 
+      message: err.message
+    });
+  }
+});
+
+// API endpoint for workload clusters (with improved caching)
+app.get('/api/cluster-api/workload-clusters', async (req, res) => {
+  try {
+    console.log('Fetching Cluster API workload clusters');
+    
+    // Check cache first
+    const cacheKey = 'workload-clusters';
+    const cachedData = apiCache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('Returning cached workload clusters');
+      return res.json(cachedData);
+    }
+    
+    // Get clusters using Custom Resources API
+    const customObjectsApi = kc.makeApiClient(k8s.CustomObjectsApi);
+    
+    let response;
+    try {
+      response = await customObjectsApi.listClusterCustomObject(
+        'cluster.x-k8s.io', 
+        'v1beta1', 
+        'clusters'
+      );
+    } catch (err) {
+      // Handle the case where Cluster API CRDs are not installed
+      console.warn('Failed to fetch Cluster API resources, they may not be installed:', err.message);
+      
+      // Return empty list
+      const emptyResponse = { 
+        kind: 'ClusterList',
+        apiVersion: 'cluster.x-k8s.io/v1beta1',
+        items: [] 
+      };
+      
+      // Cache empty response for a short time
+      apiCache.set(cacheKey, emptyResponse);
+      apiCache.setMaxAge(cacheKey, 10000); // 10 seconds for empty results
+      
+      return res.json(emptyResponse);
+    }
+    
+    // Store in cache with 45s TTL
+    apiCache.set(cacheKey, response.body);
+    apiCache.setMaxAge(cacheKey, 45000); // 45 seconds
+    
+    res.json(response.body);
+  } catch (err) {
+    console.error('Error fetching workload clusters:', err);
+    res.status(500).json({ 
+      error: 'Failed to fetch workload clusters', 
+      message: err.message 
+    });
+  }
+});
+
+// API endpoint for a specific cluster with caching
+app.get('/api/cluster-api/clusters/:namespace/:name', async (req, res) => {
+  try {
+    const { namespace, name } = req.params;
+    console.log(`Fetching Cluster API cluster: ${namespace}/${name}`);
+    
+    // Check cache first
+    const cacheKey = `cluster:${namespace}:${name}`;
+    const cachedData = apiCache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log(`Returning cached cluster data for ${namespace}/${name}`);
+      return res.json(cachedData);
+    }
+    
+    // Get cluster using Custom Resources API
+    const customObjectsApi = kc.makeApiClient(k8s.CustomObjectsApi);
+    const response = await customObjectsApi.getNamespacedCustomObject(
+      'cluster.x-k8s.io', 
+      'v1beta1', 
+      namespace,
+      'clusters',
+      name
+    );
+    
+    // Cache the result with 60s TTL
+    apiCache.set(cacheKey, response.body);
+    apiCache.setMaxAge(cacheKey, 60000); // 60 seconds
+    
+    res.json(response.body);
+  } catch (err) {
+    console.error(`Error fetching cluster ${req.params.namespace}/${req.params.name}:`, err);
+    res.status(500).json({ 
+      error: 'Failed to fetch cluster details', 
+      message: err.message 
+    });
+  }
+});
+
+// API endpoint for a cluster's machines with caching
+app.get('/api/cluster-api/clusters/:namespace/:name/machines', async (req, res) => {
+  try {
+    const { namespace, name } = req.params;
+    console.log(`Fetching machines for cluster: ${namespace}/${name}`);
+    
+    // Check cache first
+    const cacheKey = `machines:${namespace}:${name}`;
+    const cachedData = apiCache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log(`Returning cached machines for cluster ${namespace}/${name}`);
+      return res.json(cachedData);
+    }
+    
+    // Get machines using Custom Resources API
+    const customObjectsApi = kc.makeApiClient(k8s.CustomObjectsApi);
+    const response = await customObjectsApi.listNamespacedCustomObject(
+      'cluster.x-k8s.io', 
+      'v1beta1', 
+      namespace,
+      'machines'
+    );
+    
+    // Filter machines that belong to this cluster
+    const allMachines = response.body?.items || [];
+    const clusterMachines = allMachines.filter(machine => {
+      const clusterName = machine.metadata?.labels?.['cluster.x-k8s.io/cluster-name'];
+      return clusterName === name;
+    });
+    
+    const machineList = {
+      kind: 'MachineList',
+      apiVersion: 'cluster.x-k8s.io/v1beta1',
+      items: clusterMachines
+    };
+    
+    // Cache the result with 30s TTL
+    apiCache.set(cacheKey, machineList);
+    apiCache.setMaxAge(cacheKey, 30000); // 30 seconds
+    
+    res.json(machineList);
+  } catch (err) {
+    console.error(`Error fetching machines for cluster ${req.params.namespace}/${req.params.name}:`, err);
+    res.status(500).json({ 
+      error: 'Failed to fetch cluster machines', 
+      message: err.message 
+    });
+  }
 });
 
 app.listen(port, () => {

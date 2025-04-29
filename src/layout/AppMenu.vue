@@ -151,6 +151,22 @@ const model = ref([
                 to: '/policies/limitranges'
             }
         ]
+    },
+    {
+        label: 'Cluster API',
+        icon: 'pi pi-fw pi-sitemap',
+        items: [
+            {
+                label: 'Management Cluster', 
+                icon: 'pi pi-fw pi-cloud',
+                to: '/cluster-api/management'
+            },
+            {
+                label: 'Workload Clusters',
+                icon: 'pi pi-fw pi-server',
+                to: '/cluster-api/workload'
+            }
+        ]
     }
     // Add other top-level categories like Networking, Storage, Config later
 ]);
