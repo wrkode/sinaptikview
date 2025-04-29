@@ -14,7 +14,8 @@
 <script setup>
 import * as d3 from 'd3';
 import Button from 'primevue/button';
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { createApp, h, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import ClusterNode from './ClusterNode.vue';
 
 const props = defineProps({
   dataset: {
@@ -40,18 +41,20 @@ const props = defineProps({
   }
 });
 
-const emit = defineEmits(['scale']);
+const emit = defineEmits(['scale', 'node-click']);
 
 const treeContainer = ref(null);
 let svg = null;
 let g = null;
 let zoomInstance = null;
 let root = null;
-let treeData = null;
 let linkGenerator = null;
 let renderTimeout = null;
 let lastZoomTime = 0;
 let zoomDebounceDelay = 100; // ms
+
+// Track mounted Vue apps for cleanup
+const mountedApps = ref({});
 
 // Scale for zooming
 const currentScale = ref(1);
@@ -73,8 +76,20 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize);
   if (renderTimeout) clearTimeout(renderTimeout);
+  
+  // Unmount all Vue apps created by this component
+  console.log('[VueTree Unmount] Cleaning up mounted Vue apps');
+  Object.keys(mountedApps.value).forEach(nodeId => {
+    try {
+      mountedApps.value[nodeId]?.unmount();
+    } catch (e) {
+      console.warn(`[VueTree Unmount] Error unmounting app for node ${nodeId}:`, e);
+    }
+  });
+  mountedApps.value = {};
+
+  // Clean up D3 elements and listeners
   if (zoomInstance && svg) {
-    // Remove all event listeners and clean up D3
     svg.on('.zoom', null);
     if (svg) svg.selectAll('*').remove();
     svg = null;
@@ -155,128 +170,145 @@ function initializeTree() {
 }
 
 function updateLinkGenerator() {
+  const nodeWidth = props.config.nodeWidth;
+  //const nodeHeight = props.config.nodeHeight; // Not needed for horizontal links
+
   if (props.linkStyle === 'curve') {
     linkGenerator = d3.linkHorizontal()
-      .x(d => d.y)
-      .y(d => d.x);
+      .source(d => [d.source.y + nodeWidth / 2, d.source.x]) // [startX, startY]
+      .target(d => [d.target.y - nodeWidth / 2, d.target.x]); // [endX, endY]
   } else { // straight
-    linkGenerator = d3.line()
-      .x(d => d.y)
-      .y(d => d.x);
+    linkGenerator = d => {
+      const startX = d.source.y + nodeWidth / 2;
+      const startY = d.source.x;
+      const endX = d.target.y - nodeWidth / 2;
+      const endY = d.target.x;
+      // Use d3.line() to generate the path string for a straight line
+      // Need to format the points correctly for d3.line: [[x0, y0], [x1, y1]]
+      const lineData = [[startX, startY], [endX, endY]];
+      return d3.line()(lineData); 
+    };
   }
 }
 
 function updateTree() {
-  if (!svg || !props.dataset || !treeContainer.value) return;
-
-  // Process the data with D3's hierarchy
+  if (!svg || !props.dataset || !treeContainer.value) {
+    console.warn('Cannot update tree - missing required elements:', { 
+      svg: !!svg, 
+      dataset: !!props.dataset, 
+      treeContainer: !!treeContainer.value 
+    });
+    return;
+  }
   root = d3.hierarchy(props.dataset, d => d.children);
-  
-  // Set up the tree layout
   const treeLayout = d3.tree()
-    .nodeSize([props.config.nodeHeight + 20, props.config.nodeWidth + 40])
-    .separation((a, b) => a.parent === b.parent ? 1 : 1.2);
-  
-  // Apply the layout
+    .nodeSize([props.config.nodeHeight + 40, props.config.nodeWidth + 60])
+    .separation((a, b) => a.parent === b.parent ? 1.5 : 2);
   treeLayout(root);
-  
-  // Update nodes and links
   updateNodes();
   updateLinks();
-  
-  // Center the tree
   centerTree();
 }
 
 function updateNodes() {
   if (!g || !root) return;
   
-  // Performance optimization: select nodes only once
   const allNodes = root.descendants();
   
-  // Use virtualization concept - only render nodes that would be visible
-  // This is a simplified approach; a full virtualization would be more complex
-  const nodes = g.selectAll('.vue-tree-node')
-    .data(allNodes, d => d.data.id || (d.data.id = Math.random().toString(36).substr(2, 9)));
+  const nodesSelection = g.selectAll('.vue-tree-node')
+    .data(allNodes, d => d.data.id || (d.data.id = `node-${Math.random().toString(36).substr(2, 9)}`));
     
-  // Remove nodes that no longer exist
-  nodes.exit().remove();
+  nodesSelection.exit().each(function(d) {
+      const nodeId = d.data.id;
+      if (mountedApps.value[nodeId]) {
+        try {
+            mountedApps.value[nodeId].unmount();
+        } catch (e) {
+            console.warn('Error during unmount:', e);
+        }
+        delete mountedApps.value[nodeId];
+      }
+    }).remove();
   
-  // Create new nodes only when needed
-  const nodeEnter = nodes.enter()
+  const nodeEnter = nodesSelection.enter()
     .append('foreignObject')
     .attr('class', 'vue-tree-node')
     .attr('width', props.config.nodeWidth)
     .attr('height', props.config.nodeHeight)
-    .attr('x', d => d.y)
-    .attr('y', d => d.x - props.config.nodeHeight / 2);
-  
-  // Create a div for each node to hold the slot content
-  nodeEnter.append('xhtml:div')
-    .attr('class', 'vue-tree-node-container')
-    .each(function(d) {
-      d3.select(this)
-        .append('div')
-        .attr('class', 'vue-tree-node-content')
-        .text(d.data.name);
-    });
+    .style('cursor', d => (d.data && d.data.kind === 'ManagementCluster') || !d.data?.id ? 'default' : 'pointer')
+    .on('click', handleNodeClick)
+    .attr('x', d => d.parent ? d.parent.y : d.y) 
+    .attr('y', d => d.parent ? d.parent.x - props.config.nodeHeight / 2 : d.x - props.config.nodeHeight / 2)
+    .style('opacity', 0);
+
+  nodeEnter.each(function(d) {
+      const nodeId = d.data.id;
+      const mountPoint = d3.select(this).append('xhtml:div')
+          .attr('id', `vue-mount-${nodeId}`)
+          .attr('class', 'vue-node-mount-point'); 
+          
+      if (mountPoint.node()) {
+          try {
+              const app = createApp(h(ClusterNode, { node: d.data })); 
+              app.mount(mountPoint.node()); 
+              mountedApps.value[nodeId] = app; 
+          } catch (e) {
+              console.error(`[VueTree UpdateNodes Enter] Error mounting Vue app for node ${nodeId}:`, e);
+          }
+      } else {
+           console.error(`[VueTree UpdateNodes Enter] Mount point div not found for node ${nodeId}`);
+      }
+  });
     
-  // Update positions of existing nodes with transition for smoother rendering
-  nodes.transition()
-    .duration(300)
+  const mergedNodes = nodeEnter.merge(nodesSelection);
+
+  mergedNodes.style('cursor', d => (d.data && d.data.kind === 'ManagementCluster') || !d.data?.id ? 'default' : 'pointer');
+
+  mergedNodes.transition('nodeMove')
+    .duration(750)
     .attr('x', d => d.y)
-    .attr('y', d => d.x - props.config.nodeHeight / 2);
+    .attr('y', d => d.x - props.config.nodeHeight / 2)
+    .style('opacity', 1)
+    .on('end', () => {});
 }
 
 function updateLinks() {
   if (!g || !root) return;
   
-  // Select all existing links
-  const links = g.selectAll('.vue-tree-link')
-    .data(root.links(), d => d.source.data.id + '-' + d.target.data.id);
+  const allLinks = root.links();
+
+  const linksSelection = g.selectAll('.vue-tree-link')
+    .data(allLinks, d => d.source.data.id + '-' + d.target.data.id);
     
-  // Remove links that no longer exist
-  links.exit().remove();
+  linksSelection.exit().remove();
   
-  // Create new links
-  links.enter()
+  linksSelection.enter()
     .append('path')
     .attr('class', 'vue-tree-link')
-    .merge(links) // Apply to new and existing links
-    .attr('d', d => {
-      if (props.linkStyle === 'curve') {
-        return linkGenerator(d);
-      } else { // straight
-        return linkGenerator([
-          { x: d.source.x, y: d.source.y + props.config.nodeWidth / 2 },
-          { x: d.target.x, y: d.target.y - 10 }
-        ]);
-      }
-    });
+    .merge(linksSelection)
+    .transition('linkDraw')
+    .duration(300)
+    .attr('d', linkGenerator)
+    .on('end', () => {});
 }
 
 function centerTree() {
   if (!svg || !g || !root || !treeContainer.value) return;
   
-  // Get the SVG dimensions
   const width = treeContainer.value.clientWidth;
   const height = treeContainer.value.clientHeight;
-  
-  // Calculate the center position
   const centerX = width / 2;
   const centerY = height / 2;
   
-  // Reset the transform
-  zoomInstance.transform(svg, d3.zoomIdentity);
+  const initialX = centerX - (root.y || 0);
+  const initialY = centerY - (root.x || 0);
+  const defaultScale = 0.8;
   
-  // Apply a translation to center the tree
-  const transform = d3.zoomIdentity
-    .translate(centerX - root.y, centerY)
-    .scale(1);
-    
-  svg.transition()
+  const calculatedTransform = d3.zoomIdentity.translate(initialX, initialY).scale(defaultScale);
+  
+  svg.transition('center')
     .duration(750)
-    .call(zoomInstance.transform, transform);
+    .call(zoomInstance.transform, calculatedTransform);
 }
 
 function zoomIn() {
@@ -306,6 +338,19 @@ function handleResize() {
     }
   }, 100);
 }
+
+// Function to handle node clicks emitted from D3
+function handleNodeClick(event, d) {
+  // Prevent click on management cluster or if no data
+  if (!d || !d.data || d.data.isManagement || d.data.kind === 'Management') {
+    console.log('[VueTree Click] Ignored click on management node or node without data.');
+    return;
+  }
+  
+  console.log('[VueTree Click] Node clicked:', d.data);
+  // Emit an event with the original node data object
+  emit('node-click', d.data);
+}
 </script>
 
 <style scoped>
@@ -330,10 +375,16 @@ function handleResize() {
   z-index: 10;
 }
 
+:deep(.vue-tree-svg) {
+    display: block; 
+    width: 100%;
+    height: 100%;
+}
+
 :deep(.vue-tree-link) {
   fill: none;
-  stroke: var(--surface-border, #dee2e6);
-  stroke-width: 1.5px;
+  stroke: #6c757d; /* Use a darker gray, e.g., Bootstrap's secondary color */
+  stroke-width: 2px; /* Make slightly thicker */
 }
 
 :deep(.vue-tree-node-container) {
@@ -353,5 +404,14 @@ function handleResize() {
   height: 100%;
   box-sizing: border-box;
   overflow: hidden;
+}
+
+:deep(.vue-tree-node) {
+}
+
+/* Add style for the mount point div if needed, e.g., ensure it fills the foreignObject */
+:deep(.vue-node-mount-point) {
+    width: 100%;
+    height: 100%;
 }
 </style> 

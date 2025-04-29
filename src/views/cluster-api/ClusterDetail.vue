@@ -3,29 +3,27 @@
     <div class="header">
       <div class="title-container">
         <h1>{{ clusterName }}</h1>
-        <StatusBadge v-if="cluster" :status="cluster.status?.phase || 'Unknown'" />
+        <StatusBadge v-if="cluster?.status?.phase" :status="cluster.status.phase" />
       </div>
       <div class="actions">
-        <Button icon="pi pi-refresh" @click="fetchClusterData" class="p-button-outlined" />
+        <Button icon="pi pi-refresh" @click="fetchClusterData" class="p-button-outlined" :disabled="loading" />
       </div>
     </div>
     
     <div v-if="loading" class="loading-container">
       <ProgressSpinner />
-      <p>Loading cluster data...</p>
+      <p>Loading cluster details...</p>
     </div>
     
     <div v-else-if="error" class="error-container">
       <Message severity="error" :closable="false">
-        <template #content>
-          <p>{{ error }}</p>
-          <Button label="Retry" @click="fetchClusterData" class="p-button-sm" />
-        </template>
+        Failed to load cluster details for {{ namespace }}/{{ name }}: {{ error }}
       </Message>
+      <Button label="Retry" @click="fetchClusterData" class="p-button-sm" />
     </div>
     
     <div v-else-if="cluster" class="content">
-      <TabView @tab-change="onTabChange">
+      <TabView v-model:activeIndex="activeTabIndex" @tab-change="onTabChange($event.index)">
         <TabPanel header="Overview">
           <div class="overview-section">
             <div class="metadata-panel">
@@ -64,8 +62,7 @@
                 </div>
               </div>
             </div>
-            
-            <div class="conditions-panel" v-if="cluster.status?.conditions">
+            <div class="conditions-panel" v-if="cluster.status?.conditions?.length > 0">
               <h2>Conditions</h2>
               <DataTable :value="cluster.status.conditions" stripedRows>
                 <Column field="type" header="Type" />
@@ -76,7 +73,7 @@
                     {{ formatDate(data.lastTransitionTime) }}
                   </template>
                 </Column>
-                <Column field="message" header="Message" />
+                <Column field="message" header="Message" style="white-space: pre-wrap; word-break: break-word;" />
               </DataTable>
             </div>
           </div>
@@ -119,24 +116,21 @@
         
         <TabPanel header="YAML">
           <div class="yaml-section">
-            <div class="yaml-actions">
-              <Button icon="pi pi-copy" @click="copyYaml" class="p-button-text" />
-            </div>
             <pre class="yaml-content">{{ clusterYaml }}</pre>
           </div>
         </TabPanel>
       </TabView>
     </div>
     
-    <Toast />
+    <div v-else class="not-found">
+      <Message severity="warn">Cluster data not found.</Message>
+    </div>
   </div>
 </template>
 
 <script setup>
 import cacheService from '@/services/CacheService';
 import axios from 'axios';
-import yaml from 'js-yaml';
-import { useToast } from 'primevue/usetoast';
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue';
 import { useRoute } from 'vue-router';
 
@@ -147,7 +141,6 @@ import Message from 'primevue/message';
 import ProgressSpinner from 'primevue/progressspinner';
 import TabPanel from 'primevue/tabpanel';
 import TabView from 'primevue/tabview';
-import Toast from 'primevue/toast';
 
 import StatusBadge from '@/components/cluster-api/StatusBadge.vue';
 
@@ -161,7 +154,6 @@ const machines = shallowRef([]);
 const loading = ref(true);
 const loadingMachines = ref(false);
 const error = ref(null);
-let yamlGenerationTimeout = null;
 
 // Tabs
 const activeTabIndex = ref(0);
@@ -170,9 +162,6 @@ const tabsLoaded = ref({
   1: false, // Machines tab
   2: false  // YAML tab
 });
-
-// Toast
-const toast = useToast();
 
 // Cache keys
 const clusterCacheKey = `cluster:${namespace}:${name}`;
@@ -184,16 +173,18 @@ const clusterName = computed(() => {
 });
 
 const infrastructureProvider = computed(() => {
-  if (cluster.value?.spec?.infrastructureRef) {
-    return cluster.value.spec.infrastructureRef.kind || 'Unknown';
-  }
-  return 'Unknown';
+  return cluster.value?.spec?.infrastructureRef?.kind || cluster.value?.metadata?.infrastructureProvider || 'Unknown';
 });
 
-// Lazily compute YAML only when needed
+// Lazily compute YAML (show JSON for now)
 const clusterYaml = computed(() => {
-  if (!cluster.value || activeTabIndex.value !== 2 || !tabsLoaded.value[2]) return '';
-  return ''; // Will be populated asynchronously
+  if (!cluster.value || activeTabIndex.value !== 2 || !tabsLoaded.value[2]) return 'Loading YAML...';
+  try {
+    return JSON.stringify(cluster.value, null, 2); 
+  } catch (err) {
+    console.error("Error stringifying cluster data:", err);
+    return "Error displaying cluster data.";
+  }
 });
 
 // Methods
@@ -202,33 +193,23 @@ const fetchClusterData = async () => {
     loading.value = true;
     error.value = null;
     
-    // Try to use cached data first
     const cachedData = cacheService.get(clusterCacheKey);
     if (cachedData) {
       cluster.value = cachedData;
       loading.value = false;
       tabsLoaded.value[0] = true;
-      
-      // Only fetch machines if we need them
-      if (activeTabIndex.value === 1) {
-        fetchMachines();
-      }
+      if (activeTabIndex.value === 1) fetchMachines();
+      if (activeTabIndex.value === 2) tabsLoaded.value[2] = true; // Mark YAML as loaded if viewing cached data
       return;
     }
     
     const response = await axios.get(`/api/cluster-api/clusters/${namespace}/${name}`);
     cluster.value = response.data;
-    
-    // Cache the result (60 seconds TTL)
     cacheService.set(clusterCacheKey, response.data, 60000);
-    
-    // Mark overview tab as loaded
     tabsLoaded.value[0] = true;
-    
-    // Only fetch machines if we need them (user selects the tab)
-    if (activeTabIndex.value === 1) {
-      fetchMachines();
-    }
+    if (activeTabIndex.value === 1) fetchMachines();
+    if (activeTabIndex.value === 2) tabsLoaded.value[2] = true; // Mark YAML as loaded
+
   } catch (err) {
     console.error('Error fetching cluster details:', err);
     error.value = err.response?.data?.message || 'Failed to fetch cluster details';
@@ -238,12 +219,10 @@ const fetchClusterData = async () => {
 };
 
 const fetchMachines = async () => {
-  if (tabsLoaded.value[1]) return; // Already loaded
+  if (tabsLoaded.value[1]) return;
   
   try {
     loadingMachines.value = true;
-    
-    // Try to use cached data first
     const cachedMachines = cacheService.get(machinesCacheKey);
     if (cachedMachines) {
       machines.value = cachedMachines;
@@ -254,15 +233,12 @@ const fetchMachines = async () => {
     
     const response = await axios.get(`/api/cluster-api/clusters/${namespace}/${name}/machines`);
     machines.value = response.data.items || [];
-    
-    // Cache the result (30 seconds TTL)
     cacheService.set(machinesCacheKey, response.data.items || [], 30000);
-    
-    // Mark machines tab as loaded
     tabsLoaded.value[1] = true;
   } catch (err) {
     console.error('Error fetching machines:', err);
-    machines.value = [];
+    machines.value = []; // Clear machines on error
+    // Optionally set an error message specific to machines
   } finally {
     loadingMachines.value = false;
   }
@@ -270,132 +246,65 @@ const fetchMachines = async () => {
 
 // Handle tab change to lazy load content
 const onTabChange = (index) => {
-  activeTabIndex.value = index;
+  console.log(`Tab changed to index: ${index}`);
+  // No need to set activeTabIndex here, v-model handles it
+  // activeTabIndex.value = index; 
   
   if (index === 1 && !tabsLoaded.value[1]) {
-    // Load machines data when Machines tab is selected
     fetchMachines();
   }
   else if (index === 2 && !tabsLoaded.value[2]) {
-    // Load YAML data when YAML tab is selected
-    tabsLoaded.value[2] = true;
-    
-    // Generate YAML asynchronously with a worker if available
-    generateYamlAsync();
+    // Mark YAML tab as loaded; computation is handled by computed property
+    tabsLoaded.value[2] = true; 
   }
-};
-
-const generateYamlAsync = () => {
-  if (yamlGenerationTimeout) {
-    clearTimeout(yamlGenerationTimeout);
-  }
-  
-  // First show immediate feedback with a small JSON sample
-  const yamlElement = document.querySelector('.yaml-content');
-  if (yamlElement && cluster.value) {
-    const previewData = {
-      apiVersion: cluster.value.apiVersion,
-      kind: cluster.value.kind,
-      metadata: {
-        name: cluster.value.metadata?.name,
-        namespace: cluster.value.metadata?.namespace
-      }
-    };
-    yamlElement.textContent = "Loading full YAML...\n\n" + JSON.stringify(previewData, null, 2);
-  }
-  
-  // Then generate the full YAML asynchronously
-  yamlGenerationTimeout = setTimeout(() => {
-    try {
-      if (!cluster.value) return;
-      
-      // This could be moved to a web worker for large objects
-      const yamlData = yaml.dump(cluster.value);
-      
-      if (yamlElement) {
-        yamlElement.textContent = yamlData;
-      }
-    } catch (err) {
-      console.error('Error generating YAML:', err);
-      if (yamlElement) {
-        yamlElement.textContent = "Error generating YAML: " + err.message;
-      }
-    }
-  }, 100);
 };
 
 const formatDate = (dateString) => {
   if (!dateString) return 'Unknown';
-  
   const date = new Date(dateString);
-  return new Intl.DateTimeFormat('en-US', {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit'
+  return new Intl.DateTimeFormat('en-US', { /* Formatting options */ 
+      year: 'numeric', month: 'short', day: 'numeric', 
+      hour: '2-digit', minute: '2-digit' 
   }).format(date);
 };
 
 const getProviderIcon = (provider) => {
-  switch (provider) {
-    case 'AzureCluster':
-      return 'pi pi-microsoft';
-    case 'DockerCluster':
-      return 'pi pi-server';
-    case 'GCPCluster':
-      return 'pi pi-google';
-    case 'AWSCluster':
-      return 'pi pi-amazon';
-    default:
-      return 'pi pi-cloud';
-  }
-};
-
-const copyYaml = () => {
-  const yamlElement = document.querySelector('.yaml-content');
-  if (yamlElement) {
-    navigator.clipboard.writeText(yamlElement.textContent)
-      .then(() => {
-        toast.add({ severity: 'success', summary: 'Copied', detail: 'YAML copied to clipboard', life: 3000 });
-      })
-      .catch(err => {
-        console.error('Error copying YAML:', err);
-        toast.add({ severity: 'error', summary: 'Error', detail: 'Failed to copy YAML', life: 3000 });
-      });
-  }
+  const providerLower = provider?.toString().toLowerCase() || '';
+  if (providerLower.includes('azure')) return 'pi pi-microsoft';
+  if (providerLower.includes('docker')) return 'pi pi-server'; 
+  if (providerLower.includes('gcp')) return 'pi pi-google';
+  if (providerLower.includes('aws')) return 'pi pi-amazon';
+  if (providerLower.includes('vsphere')) return 'pi pi-desktop';
+  // Add other providers as needed
+  return 'pi pi-cloud';
 };
 
 // Lifecycle hooks
 onMounted(() => {
   fetchClusterData();
   document.title = `Cluster: ${name} | SinaptikView`;
-  
-  // Set default tab to loaded
-  tabsLoaded.value[0] = true;
+  tabsLoaded.value[0] = true; // Assume overview tab is loaded initially
 });
 
-// Cleanup on component destroy
 onBeforeUnmount(() => {
-  if (yamlGenerationTimeout) {
-    clearTimeout(yamlGenerationTimeout);
-  }
+  // Cleanup if needed
 });
 </script>
 
 <style scoped>
 .cluster-detail-view {
-  height: 100%;
+  height: 100%; /* Ensure it takes full height if needed */
   display: flex;
   flex-direction: column;
   padding: 1rem;
+  gap: 1rem; /* Add gap between header and content */
 }
 
 .header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 1rem;
+  flex-shrink: 0; /* Prevent header shrinking */
 }
 
 .title-container {
@@ -411,42 +320,52 @@ onBeforeUnmount(() => {
 }
 
 .content {
-  flex: 1;
-  overflow: auto;
+  flex: 1; /* Allow content to grow */
+  overflow: auto; /* Add scroll if content overflows */
+  min-height: 0; /* Important for flex-grow in some contexts */
 }
 
-.loading-container {
-  flex: 1;
+.loading-container,
+.error-container,
+.not-found {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  min-height: 300px;
   gap: 1rem;
+  flex: 1; /* Allow these states to take up space */
 }
 
 .overview-section {
   display: flex;
   flex-direction: column;
-  gap: 2rem;
+  gap: 1.5rem;
 }
 
 .metadata-panel, .conditions-panel {
   background-color: var(--surface-card);
   border-radius: 8px;
   padding: 1.5rem;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.metadata-panel h2, .conditions-panel h2 {
+  margin-top: 0;
+  margin-bottom: 1rem;
+  font-size: 1.2rem;
 }
 
 .metadata-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 1.5rem;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); /* Responsive grid */
+  gap: 1rem 1.5rem; /* Row and column gap */
 }
 
 .metadata-item {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 0.25rem;
 }
 
 .metadata-label {
@@ -467,37 +386,28 @@ onBeforeUnmount(() => {
 
 .provider-icon {
   font-size: 1.2rem;
-  color: var(--primary-color);
+  /* color: var(--primary-color); Optional: color the icon */
 }
 
 .yaml-section {
   position: relative;
-  background-color: var(--surface-ground);
-  border-radius: 8px;
-  height: 100%;
-}
-
-.yaml-actions {
-  position: absolute;
-  top: 1rem;
-  right: 1rem;
-  z-index: 1;
 }
 
 .yaml-content {
-  padding: 1.5rem;
+  padding: 1rem;
   white-space: pre-wrap;
+  word-break: break-all; /* Allow long strings to wrap */
   font-family: monospace;
   font-size: 0.875rem;
   line-height: 1.6;
-  overflow: auto;
-  max-height: 600px;
   background-color: var(--surface-card);
-  border-radius: 8px;
+  border-radius: 6px;
+  max-height: 600px; /* Limit height and allow scroll */
+  overflow: auto;
 }
 
 .machines-section {
-  height: 100%;
+  /* Styles for machines section if needed */
 }
 
 .loading-machines, .no-machines {
@@ -508,9 +418,20 @@ onBeforeUnmount(() => {
   padding: 3rem;
   gap: 1rem;
   color: var(--text-color-secondary);
+  min-height: 200px; /* Ensure some space */
 }
 
 .loading-machines i, .no-machines i {
   font-size: 2rem;
 }
+
+/* Deep selectors might be needed if PrimeVue components encapsulate styles */
+:deep(.p-tabview-panels) {
+  padding: 1rem 0 0 0; /* Adjust padding for tab panels */
+}
+
+:deep(.p-datatable .p-datatable-thead > tr > th) {
+  background-color: var(--surface-ground); /* Style datatable header */
+}
+
 </style> 

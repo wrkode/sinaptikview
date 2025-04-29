@@ -1,5 +1,6 @@
 const express = require('express');
 const k8s = require('@kubernetes/client-node');
+const { exec } = require('child_process');
 
 const app = express();
 const port = 3001; // Port for the backend server
@@ -11,6 +12,9 @@ kc.loadFromDefault();
 
 const k8sApi = kc.makeApiClient(k8s.CoreV1Api);
 const k8sAppsApi = kc.makeApiClient(k8s.AppsV1Api); // Add AppsV1Api client
+
+// Import the CustomObjectsApi for CRDs like Cluster API resources
+const k8sCustomApi = kc.makeApiClient(k8s.CustomObjectsApi);
 
 // Add a simple cache system
 const apiCache = {
@@ -1333,179 +1337,132 @@ app.get('/api/v1/namespaces/:namespace/poddisruptionbudgets/:name', async (req, 
     }
 });
 
-// API endpoint for Cluster API management cluster tree (with caching)
+// Helper function to execute kubectl
+const execKubectl = (command) => {
+  return new Promise((resolve, reject) => {
+    console.log(`Executing: kubectl ${command}`);
+    exec(`kubectl ${command}`, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`kubectl error for command "${command}":`, stderr || error.message);
+        reject(new Error(stderr || error.message));
+        return;
+      }
+      if (stderr) {
+         console.warn(`kubectl stderr for command "${command}":`, stderr);
+      }
+      try {
+        const result = JSON.parse(stdout);
+        console.log(`kubectl command "${command}" successful.`);
+        resolve(result);
+      } catch (parseErr) {
+        console.error(`Failed to parse kubectl output for command "${command}":`, parseErr);
+        reject(parseErr);
+      }
+    });
+  });
+};
+
+// API endpoint for Cluster API management cluster
 app.get('/api/cluster-api/management-cluster', async (req, res) => {
-  try {
-    console.log('Fetching Cluster API management cluster tree');
-    
-    // Check cache first
-    const cacheKey = 'management-cluster-tree';
+  console.log('Fetching Cluster API management cluster data using kubectl');
+  
+  const cacheKey = 'cluster-api-management-cluster';
+  if (!req.query.bypassCache) {
     const cachedData = apiCache.get(cacheKey);
-    
     if (cachedData) {
-      console.log('Returning cached management cluster tree');
+      console.log('Returning cached management cluster data');
       return res.json(cachedData);
     }
+  }
+  
+  try {
+    // Fetch all clusters from all namespaces using kubectl
+    const clusterList = await execKubectl('get clusters -A -o json'); // Use -A for all namespaces
     
-    // Since kubectl works but the K8s client doesn't, use kubectl directly
-    const { exec } = require('child_process');
-    
-    // Use Promise to handle the async exec call
-    const execKubectl = () => {
-      return new Promise((resolve, reject) => {
-        exec('kubectl -n kcm-system get clusters -o json', (error, stdout, stderr) => {
-          if (error) {
-            console.log('kubectl error:', error);
-            reject(error);
-            return;
-          }
-          
-          try {
-            const result = JSON.parse(stdout);
-            console.log('kubectl found clusters for tree:', result.items?.length || 0);
-            resolve(result.items || []);
-          } catch (parseErr) {
-            console.log('Failed to parse kubectl output for tree:', parseErr.message);
-            reject(parseErr);
-          }
-        });
-      });
+    const managementCluster = {
+      kind: "Management",
+      name: "management-cluster", // Or derive from context if possible
+      status: "Running", // Assuming management cluster is always running
+      isManagement: true,
+      children: []
     };
-    
-    try {
-      // Get the clusters using kubectl
-      const clusters = await execKubectl();
       
-      console.log(`Building tree with ${clusters.length} clusters from kubectl`);
+    if (clusterList && clusterList.items) {
+      console.log(`Found ${clusterList.items.length} Cluster API clusters via kubectl`);
       
-      // Construct the tree structure more efficiently
-      const managementClusterNode = {
-        name: 'Management',
-        isManagement: true,
-        namespace: '',
-        infrastructureProvider: 'Unknown',
-        children: clusters.map(cluster => {
-          const clusterNode = {
-            name: cluster.metadata?.name || 'Unnamed',
-            namespace: cluster.metadata?.namespace || 'default',
-            phase: cluster.status?.phase || 'Unknown',
-            infrastructureProvider: cluster.spec?.infrastructureRef?.kind || 'Unknown',
-            isManagement: false
-          };
-          console.log(`Added cluster node: ${clusterNode.name} in ${clusterNode.namespace} with provider ${clusterNode.infrastructureProvider}`);
-          return clusterNode;
-        })
-      };
-      
-      // Store in cache with 60s TTL for management cluster
-      apiCache.set(cacheKey, managementClusterNode);
-      apiCache.setMaxAge(cacheKey, 60000); // 60 seconds
-      
-      res.json(managementClusterNode);
-    } catch (kubectlErr) {
-      console.error('Error executing kubectl for tree:', kubectlErr);
-      
-      // Fallback to empty response
-      const emptyResponse = {
-        name: 'Management',
-        isManagement: true,
-        namespace: '',
-        infrastructureProvider: 'Unknown',
-        children: []
-      };
-      
-      // Cache empty response for a short time
-      apiCache.set(cacheKey, emptyResponse);
-      apiCache.setMaxAge(cacheKey, 10000); // 10 seconds
-      
-      res.json(emptyResponse);
+      managementCluster.children = clusterList.items.map(cluster => ({
+        kind: "Cluster",
+        name: cluster.metadata.name,
+        namespace: cluster.metadata.namespace,
+        status: cluster.status?.phase || "Unknown",
+        // Ensure metadata structure matches frontend expectation
+        metadata: {
+          provider: cluster.spec?.infrastructureRef?.kind || "Unknown",
+          creationTimestamp: cluster.metadata.creationTimestamp,
+          version: cluster.spec?.topology?.version || cluster.spec?.version || "Unknown",
+          // Add other relevant metadata if needed by ClusterNode.vue
+          uid: cluster.metadata.uid
+        },
+        children: [] // Placeholder for potential nested structures
+      }));
+    } else {
+        console.log('No Cluster API cluster resources found via kubectl or invalid JSON structure.');
     }
+    
+    // Cache the result
+    apiCache.set(cacheKey, managementCluster);
+    apiCache.setMaxAge(cacheKey, 30000); // 30 seconds cache
+    
+    // Send the response
+    res.json(managementCluster);
+
   } catch (err) {
-    console.error('Error fetching management cluster tree:', err);
+    console.error('Error fetching management cluster data via kubectl:', err.message || err);
     res.status(500).json({ 
-      error: 'Failed to fetch management cluster tree', 
-      message: err.message
+        error: 'Failed to fetch management cluster data', 
+        details: err.message 
     });
   }
 });
 
-// API endpoint for workload clusters (with improved caching)
+// API endpoint for Cluster API workload clusters
 app.get('/api/cluster-api/workload-clusters', async (req, res) => {
-  try {
-    console.log('Fetching Cluster API workload clusters');
-    
-    // Check cache first
-    const cacheKey = 'workload-clusters';
+  console.log('Fetching Cluster API workload clusters using kubectl');
+  
+  const cacheKey = 'cluster-api-workload-clusters';
+   if (!req.query.bypassCache) {
     const cachedData = apiCache.get(cacheKey);
-    
     if (cachedData) {
-      console.log('Returning cached workload clusters');
+      console.log('Returning cached workload clusters data');
       return res.json(cachedData);
     }
-    
-    // Since kubectl works but the K8s client doesn't, use kubectl directly
-    const { exec } = require('child_process');
-    
-    // Use Promise to handle the async exec call
-    const execKubectl = () => {
-      return new Promise((resolve, reject) => {
-        exec('kubectl -n kcm-system get clusters -o json', (error, stdout, stderr) => {
-          console.log('kubectl stderr:', stderr);
-          if (error) {
-            console.log('kubectl error:', error);
-            reject(error);
-            return;
-          }
-          
-          try {
-            const result = JSON.parse(stdout);
-            console.log('kubectl found clusters:', result.items?.length || 0);
-            
-            if (result.items && result.items.length > 0) {
-              console.log('First cluster from kubectl:', result.items[0].metadata.name, 'in', result.items[0].metadata.namespace);
-            }
-            
-            resolve(result);
-          } catch (parseErr) {
-            console.log('Failed to parse kubectl output:', parseErr.message);
-            reject(parseErr);
-          }
-        });
-      });
-    };
-    
-    try {
-      // Get the clusters using kubectl
-      const clusterList = await execKubectl();
-      
-      console.log(`Successfully fetched ${clusterList.items?.length || 0} clusters using kubectl`);
-      
-      // Cache the result with 45s TTL
-      apiCache.set(cacheKey, clusterList);
-      apiCache.setMaxAge(cacheKey, 45000); // 45 seconds
-      
-      res.json(clusterList);
-    } catch (kubectlErr) {
-      console.error('Error executing kubectl:', kubectlErr);
-      
-      // Fallback to empty response
-      const emptyResponse = { 
-        kind: 'ClusterList',
-        apiVersion: 'cluster.x-k8s.io/v1beta1',
-        items: [] 
-      };
-      
-      // Cache empty response for a short time
-      apiCache.set(cacheKey, emptyResponse);
-      apiCache.setMaxAge(cacheKey, 10000); // 10 seconds for empty results
-      
-      res.json(emptyResponse);
+  }
+  
+  try {
+     // Fetch all clusters from all namespaces using kubectl
+    const clusterList = await execKubectl('get clusters -A -o json'); // Use -A for all namespaces
+
+    let clusters = [];
+    if (clusterList && clusterList.items) {
+      console.log(`Found ${clusterList.items.length} Cluster API clusters for workload list via kubectl`);
+      clusters = clusterList.items;
+    } else {
+         console.log('No Cluster API cluster resources found via kubectl or invalid JSON structure for workload list.');
     }
+    
+    // Cache the result
+    const result = { items: clusters }; // Ensure the response is { items: [...] }
+    apiCache.set(cacheKey, result);
+    apiCache.setMaxAge(cacheKey, 30000); // 30 seconds cache
+    
+    // Send the response
+    res.json(result);
+
   } catch (err) {
-    console.error('Error fetching workload clusters:', err);
-    res.status(500).json({ 
-      error: 'Failed to fetch workload clusters', 
-      message: err.message 
+    console.error('Error fetching workload clusters via kubectl:', err.message || err);
+     res.status(500).json({ 
+        error: 'Failed to fetch workload clusters', 
+        details: err.message 
     });
   }
 });
@@ -1641,6 +1598,50 @@ app.get('/api/cluster-api/clusters/:namespace/:name/machines', async (req, res) 
       error: 'Failed to fetch cluster machines', 
       message: err.message 
     });
+  }
+});
+
+// API endpoint to download kubeconfig for a specific cluster
+app.get('/api/cluster-api/clusters/:namespace/:name/kubeconfig', async (req, res) => {
+  const { namespace, name } = req.params;
+  console.log(`Attempting to fetch kubeconfig for cluster: ${namespace}/${name}`);
+
+  // Construct the secret name
+  const secretName = `${name}-kubeconfig`;
+  const command = `get secret -n ${namespace} ${secretName} -o=jsonpath={.data.value}`;
+
+  try {
+    const result = await execKubectl(command);
+    
+    // result from jsonpath might be quoted, remove quotes if they exist
+    const base64Data = result.replace(/^"(.*)"$/, '$1');
+
+    if (!base64Data) {
+        throw new Error('Kubeconfig data (.data.value) not found in secret.');
+    }
+
+    // Decode base64
+    const kubeconfig = Buffer.from(base64Data, 'base64').toString('utf8');
+
+    // Send as plain text or YAML file
+    res.setHeader('Content-Type', 'application/yaml'); // Or text/plain
+    res.setHeader('Content-Disposition', `attachment; filename="kubeconfig-${namespace}-${name}.yaml"`);
+    res.send(kubeconfig);
+
+  } catch (err) {
+    console.error(`Error fetching kubeconfig for ${namespace}/${name}:`, err.message || err);
+    // Check if error is due to secret not found
+    if (err.message && err.message.toLowerCase().includes('not found')) {
+         res.status(404).json({ 
+            error: 'Kubeconfig secret not found', 
+            details: `Secret ${secretName} in namespace ${namespace} not found.` 
+        });
+    } else {
+        res.status(500).json({ 
+            error: 'Failed to fetch kubeconfig', 
+            details: err.message 
+        });
+    }
   }
 });
 

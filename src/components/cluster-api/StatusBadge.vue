@@ -1,60 +1,37 @@
 <template>
-  <Tag :severity="getSeverity(status)" :value="getLabel(status)" />
+  <Tag :severity="getSeverity" :value="status" />
 </template>
 
 <script setup>
 import Tag from 'primevue/tag';
+import { computed } from 'vue';
 
 const props = defineProps({
   status: {
     type: String,
-    default: 'Unknown'
+    required: true
   }
 });
 
-const getSeverity = (status) => {
-  const normalized = (status || '').toLowerCase();
+const getSeverity = computed(() => {
+  const status = props.status?.toLowerCase() || 'unknown';
   
-  // Success states
-  if (
-    normalized === 'running' || 
-    normalized === 'active' || 
-    normalized === 'ready' || 
-    normalized === 'provisioned' || 
-    normalized === 'succeeded'
-  ) {
+  if (status === 'running' || status === 'ready' || status === 'healthy') {
     return 'success';
-  }
-  
-  // Warning states
-  if (
-    normalized === 'pending' || 
-    normalized === 'provisioning' || 
-    normalized === 'updating' ||
-    normalized === 'initializing'
-  ) {
+  } else if (status === 'provisioning' || status === 'pending' || status === 'processing') {
+    return 'info';
+  } else if (status === 'deleting' || status === 'warning') {
     return 'warning';
-  }
-  
-  // Error states
-  if (
-    normalized === 'failed' || 
-    normalized === 'error' || 
-    normalized === 'terminated' ||
-    normalized === 'suspended'
-  ) {
+  } else if (status === 'failed' || status === 'error') {
     return 'danger';
+  } else {
+    return 'secondary';
   }
-  
-  // Default/unknown state
-  return 'info';
-};
-
-const getLabel = (status) => {
-  return status || 'Unknown';
-};
+});
 </script>
 
 <style scoped>
-/* Custom styling if needed */
+:deep(.p-tag) {
+  text-transform: capitalize;
+}
 </style> 
