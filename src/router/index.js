@@ -257,6 +257,23 @@ const router = createRouter({
                     name: 'limitrange-detail',
                     props: true,
                     component: () => import('@/views/policies/LimitRangeDetail.vue')
+                },
+                // Cluster API Routes
+                {
+                    path: '/cluster-api/management',
+                    name: 'cluster-api-management',
+                    component: () => import('@/views/cluster-api/ManagementCluster.vue')
+                },
+                {
+                    path: '/cluster-api/workload',
+                    name: 'cluster-api-workload-list',
+                    component: () => import('@/views/cluster-api/WorkloadClusters.vue')
+                },
+                {
+                    path: '/cluster-api/clusters/:namespace/:name',
+                    name: 'cluster-api-cluster-detail',
+                    props: true,
+                    component: () => import('@/views/cluster-api/ClusterDetail.vue')
                 }
             ]
         },
