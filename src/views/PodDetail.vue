@@ -91,12 +91,18 @@
             </Column>
             <Column header="Actions">
               <template #body="slotProps">
-                <Button icon="pi pi-align-justify" class="p-button-sm p-button-secondary mr-2" label="Logs" @click="showLogs(slotProps.data.name)" />
-                <Button 
-                  icon="pi pi-terminal" 
+                <Button
+                  icon="pi pi-align-justify"
+                  class="p-button-sm p-button-secondary mr-2"
+                  label="Logs"
+                  @click="showLogs(slotProps.data.name)"
+                  v-tooltip.bottom="'View Container Logs'"
+                />
+                <Button
+                  icon="pi pi-terminal"
                   class="p-button-sm p-button-secondary"
-                  label="Exec" 
-                  @click="openTerminalDialog(namespace, podName, slotProps.data.name)" 
+                  label="Exec"
+                  @click="openTerminalDialog(namespace, podName, slotProps.data.name)"
                   v-tooltip.bottom="'Exec into Container'"
                 />
               </template>
@@ -146,6 +152,41 @@
       Pod not found.
     </div>
 
+    <!-- ADDED: Log Dialog -->
+    <Dialog
+      v-model:visible="logDialogVisible"
+      :header="`Logs: ${logTarget.podName} / ${logTarget.containerName}`"
+      :modal="true"
+      :draggable="false"
+      position="top"
+      @hide="handleLogDialogClose"
+      style="width: 90vw; height: 80vh;"
+      contentStyle="height: calc(100% - 5rem); display: flex; flex-direction: column;"
+      :dismissableMask="true"
+      :closable="true"
+    >
+      <div class="log-controls p-2 surface-section border-bottom-1 surface-border flex align-items-center gap-3">
+         <label for="tailLines" class="font-semibold">Lines:</label>
+         <InputNumber v-model="logOptions.tailLines" inputId="tailLines" :min="10" :max="5000" :step="100" showButtons style="width: 8rem;" />
+
+         <div class="flex align-items-center">
+             <Checkbox v-model="logOptions.previous" inputId="previousLogs" :binary="true" />
+             <label for="previousLogs" class="ml-2"> Show previous container logs</label>
+         </div>
+
+         <Button icon="pi pi-refresh" label="Refresh" @click="fetchLogs" :loading="loadingLogs" class="p-button-sm" />
+      </div>
+
+      <div class="log-content flex-grow-1 overflow-auto p-2" style="background-color: var(--surface-ground); font-family: monospace;">
+        <div v-if="loadingLogs" class="text-center p-4">Loading logs...</div>
+        <div v-else-if="logError" class="p-4">
+          <Message severity="error" :closable="false">Error loading logs: {{ logError }}</Message>
+        </div>
+        <pre v-else-if="logContent">{{ logContent }}</pre>
+        <div v-else class="text-center p-4 text-color-secondary">No log content available.</div>
+      </div>
+    </Dialog>
+
     <!-- ADDED: Terminal Dialog -->
     <Dialog 
       v-model:visible="terminalDialogVisible" 
@@ -174,11 +215,12 @@
 <script setup>
 import WebTerminal from '@/components/WebTerminal.vue'; // Import the WebTerminal component
 import axios from 'axios';
-import yaml from 'js-yaml'; // Import js-yaml
 import Button from 'primevue/button';
+import Checkbox from 'primevue/checkbox'; // Added
 import Column from 'primevue/column';
 import DataTable from 'primevue/datatable';
 import Dialog from 'primevue/dialog'; // Added Dialog import
+import InputNumber from 'primevue/inputnumber'; // Added
 import Message from 'primevue/message';
 import Panel from 'primevue/panel';
 import TabPanel from 'primevue/tabpanel';
@@ -200,6 +242,18 @@ const podYaml = ref('');
 const loading = ref(true); // Changed initial state to true
 const error = ref(null);
 const loadingEvents = ref(false);
+
+// --- State for Log Dialog ---
+const logDialogVisible = ref(false);
+const logTarget = ref({ namespace: '', podName: '', containerName: '' });
+const logContent = ref('');
+const loadingLogs = ref(false);
+const logError = ref(null);
+const logOptions = ref({
+  tailLines: 500,
+  previous: false,
+});
+// --- End Log Dialog State ---
 
 // Add state for Terminal Dialog
 const terminalDialogVisible = ref(false);
@@ -323,12 +377,60 @@ const fetchPodEvents = async () => {
     }
 }
 
-// Placeholder function for Logs
+// --- Log Viewing Functions ---
 const showLogs = (containerName) => {
-    // TODO: Implement log viewing functionality
-    console.log(`TODO: Show logs for container: ${containerName} in pod ${podName.value}`);
-    alert(`Log viewing for ${containerName} is not yet implemented.`);
-}
+  console.log(`Opening logs for: ${namespace.value}/${podName.value}/${containerName}`);
+  logTarget.value = {
+    namespace: namespace.value,
+    podName: podName.value,
+    containerName: containerName
+  };
+  logContent.value = ''; // Clear previous logs
+  logError.value = null; // Clear previous error
+  logDialogVisible.value = true;
+  fetchLogs(); // Fetch initial logs
+};
+
+const fetchLogs = async () => {
+  if (!logTarget.value.containerName) return;
+  loadingLogs.value = true;
+  logError.value = null;
+  logContent.value = ''; // Clear content before fetching
+
+  const params = new URLSearchParams({
+      container: logTarget.value.containerName,
+      tailLines: logOptions.value.tailLines || 500,
+      previous: logOptions.value.previous || false,
+  });
+
+  try {
+    const response = await fetch(`/api/v1/namespaces/${encodeURIComponent(logTarget.value.namespace)}/pods/${encodeURIComponent(logTarget.value.podName)}/logs?${params.toString()}`);
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ details: response.statusText })); // Try to parse JSON error, fallback to status text
+      throw new Error(errorData.details || `HTTP error! status: ${response.status}`);
+    }
+
+    // Read logs as text
+    logContent.value = await response.text();
+    if (!logContent.value) {
+         logContent.value = "[No log output received]";
+    }
+
+  } catch (err) {
+    console.error("Error fetching pod logs:", err);
+    logError.value = err.message;
+  } finally {
+    loadingLogs.value = false;
+  }
+};
+
+const handleLogDialogClose = () => {
+  console.log("Log dialog closed");
+  // Reset state if needed, but might be useful to keep options
+  // logTarget.value = { namespace: '', podName: '', containerName: '' };
+};
+// --- End Log Viewing Functions ---
 
 // *** Updated function to open the terminal dialog ***
 const openTerminalDialog = (targetNamespace, targetPodName, targetContainerName) => {
@@ -351,36 +453,26 @@ const handleTerminalDialogClose = () => {
 // Handle tab change to load data lazily
 const onTabChange = (event) => {
   const index = event.index;
-  activeTabIndex.value = index;
+  // activeTabIndex.value = index; // Need to define activeTabIndex if used
   console.log(`Tab changed to index: ${index}`);
   
-  if (index === 1 && !tabsLoaded.value[1]) { // Machines (Assuming this might be added later or was intended)
-    // fetchMachines(); // Placeholder if machines tab is added
-     tabsLoaded.value[1] = true;
-  }
-  else if (index === 2 && !tabsLoaded.value[2]) { // Containers Tab
-    // Containers are part of the main pod details, usually loaded already
-    tabsLoaded.value[2] = true; 
-  }
-   else if (index === 3 && !tabsLoaded.value[3]) { // Volumes Tab
-    tabsLoaded.value[3] = true; 
-  }
-  else if (index === 4 && !tabsLoaded.value[4]) { // Events Tab
-    fetchPodEvents(); // Events might need a refresh or initial load here
-    tabsLoaded.value[4] = true;
-  }
-  else if (index === 5 && !tabsLoaded.value[5]) { // YAML Tab
-    // Generate YAML when tab is first viewed
-    if (podDetails.value) {
-      try {
-        podYaml.value = yaml.dump(podDetails.value);
-      } catch(e) {
-        console.error("Error generating YAML:", e);
-        podYaml.value = "Error generating YAML.";
-      }
-    }
-    tabsLoaded.value[5] = true; 
-  }
+  // Assuming 0=Overview, 1=Conditions, 2=Containers, 3=Volumes, 4=Events, 5=YAML
+  // Also assuming tabsLoaded ref exists
+  // if (index === 4 && !tabsLoaded.value[4]) { // Events Tab
+  //   fetchPodEvents(); // Events might need a refresh or initial load here
+  //   tabsLoaded.value[4] = true;
+  // }
+  // else if (index === 5 && !tabsLoaded.value[5]) { // YAML Tab
+  //   if (podDetails.value && !podYaml.value) { // Generate YAML only if not already done
+  //     try {
+  //       podYaml.value = yaml.dump(podDetails.value);
+  //     } catch(e) {
+  //       console.error("Error generating YAML:", e);
+  //       podYaml.value = "Error generating YAML.";
+  //     }
+  //   }
+  //   tabsLoaded.value[5] = true; 
+  // }
 };
 
 onMounted(() => {
@@ -565,6 +657,23 @@ pre, .yaml-content {
     height: 100%; /* Take full height passed from style */
     display: flex;
     flex-direction: column;
+}
+
+.log-content pre {
+  white-space: pre-wrap; /* Allow logs to wrap */
+  word-wrap: break-word;
+  margin: 0; /* Remove default pre margin */
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.log-controls {
+  flex-shrink: 0; /* Prevent controls from shrinking */
+}
+
+.log-content {
+  flex-grow: 1; /* Allow content area to fill space */
+  min-height: 0; /* Needed for flex-grow in column layout */
 }
 
 </style> 
