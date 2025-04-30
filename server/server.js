@@ -1692,6 +1692,72 @@ app.get('/api/cluster-api/clusters/:namespace/:name/pods', async (req, res) => {
   }
 });
 
+// API endpoint for pod logs
+app.get('/api/v1/namespaces/:namespace/pods/:podName/logs', async (req, res) => {
+    const { namespace, podName } = req.params;
+    const { container, tailLines, previous } = req.query;
+
+    if (!container) {
+        return res.status(400).json({ error: 'Missing required query parameter: container' });
+    }
+
+    console.log(`Fetching logs for pod: ${namespace}/${podName}, container: ${container}, tailLines: ${tailLines}, previous: ${previous}`);
+
+    try {
+        const options = {
+             // follow: false, // We are not streaming logs here, just fetching a snapshot
+             // limitBytes: undefined, // Optional: limit response size
+             pretty: false,
+             previous: previous === 'true', // Convert query string 'true' to boolean
+             sinceSeconds: undefined,
+             // sinceTime: undefined, // Alternative to sinceSeconds
+             tailLines: tailLines ? parseInt(tailLines, 10) : 500, // Default to 500 lines
+             timestamps: true, // Include timestamps in logs
+        };
+
+        // Validate tailLines if provided
+        if (tailLines && isNaN(options.tailLines)) {
+             return res.status(400).json({ error: 'Invalid tailLines parameter, must be a number.' });
+        }
+
+        // --- Add Debug Log ---
+        // Updated log to include options being passed
+        console.log(`[Debug] Calling readNamespacedPodLog with podName: '${podName}' (type: ${typeof podName}), namespace: '${namespace}', container: '${container}', tailLines: ${options.tailLines}, previous: ${options.previous}`);
+        // --- End Debug Log ---
+
+        // --- API Call with Named Parameters and Options ---
+        console.log('[Debug] Attempting readNamespacedPodLog call with named parameters and options...');
+        const logRes = await k8sApi.readNamespacedPodLog({
+             name: podName,
+             namespace: namespace,
+             container: container,
+             // Re-add options using named fields
+             tailLines: options.tailLines,
+             timestamps: options.timestamps,
+             previous: options.previous
+             // Add other options here if needed, e.g., follow: false
+        });
+        console.log('[Debug] Call with named parameters and options succeeded (or didn\'t throw).');
+        // --- End API Call ---
+
+        // Add a log to inspect the response object type and value
+        // console.log('[Debug] Full logRes object:', logRes); // Old log
+        console.log(`[Debug] logRes type: ${typeof logRes}, value:`, logRes);
+
+        // Set content type to plain text and send the logs
+        res.setHeader('Content-Type', 'text/plain');
+        // Send logRes directly, checking if it's truthy
+        res.send(logRes || "[No log output received from API]"); 
+
+    } catch (err) {
+        console.error(`Error fetching logs for ${namespace}/${podName}/${container}:`, err.response?.body || err.message || err);
+         // Send appropriate error status code
+        const statusCode = err.response?.statusCode || 500;
+        const errorDetails = err.response?.body?.message || err.message || 'Failed to fetch logs';
+        res.status(statusCode).json({ error: 'Failed to fetch pod logs', details: errorDetails });
+    }
+});
+
 // --- Server Initialization --- 
 
 // Create HTTP server from Express app
