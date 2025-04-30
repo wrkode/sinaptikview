@@ -24,6 +24,11 @@ const router = createRouter({
                     component: () => import('@/views/Namespaces.vue')
                 },
                 {
+                    path: '/namespaces/create',
+                    name: 'namespace-create',
+                    component: () => import('@/views/CreateNamespace.vue')
+                },
+                {
                     path: '/namespaces/:name',
                     name: 'namespace-detail',
                     props: true,

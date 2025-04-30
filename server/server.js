@@ -7,8 +7,10 @@ const url = require('url'); // Import url module
 const stream = require('stream'); // Import stream module
 const pty = require('node-pty'); // Import node-pty
 const os = require('os'); // Required by node-pty
+const yaml = require('js-yaml');
 
 const app = express();
+app.use(express.json()); // <<< Add this middleware to parse JSON bodies
 const port = 3001; // Port for the backend server
 
 // Kubernetes client configuration
@@ -237,17 +239,53 @@ app.get('/api/v1/namespaces/:namespace/resourcequotas', async (req, res) => {
     const namespace = req.params.namespace;
     console.log(`Fetching ResourceQuotas for namespace: ${namespace}`);
     try {
-        const rqRes = await k8sApi.listNamespacedResourceQuota({ namespace: namespace });
-        console.log(`ResourceQuota response keys for ${namespace}:`, rqRes ? Object.keys(rqRes) : 'No response');
-        if (rqRes && rqRes.body && rqRes.body.items) {
-            res.json({ items: rqRes.body.items });
-        } else {
-            console.error(`ResourceQuota response body/items missing for ${namespace}`, rqRes);
-            res.status(500).json({ error: 'Failed to fetch ResourceQuotas', details: 'Invalid response structure' });
+        // --- API Call ---
+        console.log(`[Debug] Calling listNamespacedResourceQuota for namespace: ${namespace}`);
+        const rqRes = await k8sApi.listNamespacedResourceQuota({ namespace: namespace }); 
+        console.log(`[Debug] listNamespacedResourceQuota raw response type: ${typeof rqRes}`);
+        console.log(`[Debug] listNamespacedResourceQuota raw response keys:`, rqRes ? Object.keys(rqRes) : 'N/A');
+        // Log potentially relevant parts if they exist
+        if (rqRes) {
+            console.log(`[Debug] rqRes.body keys:`, rqRes.body ? Object.keys(rqRes.body) : 'N/A');
+            console.log(`[Debug] rqRes.body?.items exists:`, !!rqRes.body?.items);
+            console.log(`[Debug] rqRes.items exists:`, !!rqRes.items);
         }
-    } catch (err) {
-        console.error(`Error fetching ResourceQuotas for ${namespace}:`, err);
-        res.status(500).json({ error: 'Failed to fetch ResourceQuotas', details: err.message });
+        // --- End API Call ---
+
+        // --- Process Response ---
+        try {
+            let items = null;
+            if (rqRes?.body?.items) {
+                 console.log('[Debug] Found items in rqRes.body.items');
+                 items = rqRes.body.items;
+            } else if (rqRes?.items) {
+                 console.log('[Debug] Found items directly in rqRes.items');
+                 items = rqRes.items;
+            }
+            // Add more checks if needed based on logs
+
+            if (items !== null) {
+                res.json({ items: items });
+            } else {
+                console.error(`ResourceQuota items missing in response structure for ${namespace}. Raw response:`, rqRes);
+                res.status(500).json({ error: 'Failed to fetch ResourceQuotas', details: 'Unknown response structure from API' });
+            }
+        } catch (processingError) {
+             console.error(`Error processing ResourceQuota response for ${namespace}:`, processingError);
+             console.error(`Raw response object was:`, rqRes); // Log the raw response on processing error
+             res.status(500).json({ error: 'Failed to process ResourceQuota response', details: processingError.message });
+        }
+        // --- End Process Response ---
+
+    } catch (apiError) {
+        // Log the detailed API error
+        const errorBody = apiError.response?.body;
+        const errorMessage = errorBody?.message || apiError.message || 'Unknown API error';
+        const statusCode = apiError.response?.statusCode || 500;
+        console.error(`API Error fetching ResourceQuotas for ${namespace} (Status ${statusCode}):`, errorMessage);
+        if(errorBody) console.error("Full API error body:", errorBody);
+        
+        res.status(statusCode).json({ error: 'Failed to fetch ResourceQuotas', details: errorMessage });
     }
 });
 
@@ -2011,3 +2049,87 @@ const execKubectlOriginal = (command) => {
 };
 // Ensure the old app.listen is removed if it exists, as server.listen is now used
 // app.listen(port, () => { ... });
+
+// API endpoint to CREATE a namespace and optionally a ResourceQuota
+app.post('/api/v1/namespaces', async (req, res) => { 
+    const { metadata, quotas } = req.body; // Destructure metadata and potential quotas
+
+    // Basic validation on the backend as well
+    if (!metadata || !metadata.name) {
+        return res.status(400).json({ error: 'Invalid data: Missing metadata.name' });
+    }
+    
+    const namespaceName = metadata.name;
+    console.log(`Attempting to create namespace: ${namespaceName}`);
+
+    let namespaceCreateRes; // To store namespace creation result
+    let quotaCreateError = null; // To store potential quota error
+    let quotaCreateOutput = null; // To store kubectl output
+
+    try {
+        // 1. Create the Namespace
+        const namespaceManifest = {
+            apiVersion: 'v1',
+            kind: 'Namespace',
+            metadata: { name: namespaceName, labels: metadata.labels || {} }, // Ensure labels is an object
+        };
+        console.log('[Debug] Creating namespace with manifest:', JSON.stringify(namespaceManifest, null, 2));
+        namespaceCreateRes = await k8sApi.createNamespace({ body: namespaceManifest }); 
+        console.log(`Namespace '${namespaceName}' created successfully.`);
+
+        // 2. Create ResourceQuota using kubectl apply if quota data is provided
+        if (quotas && Object.keys(quotas).length > 0) {
+            console.log(`Attempting to create ResourceQuota via kubectl in namespace ${namespaceName}`);
+            const quotaManifest = {
+                apiVersion: 'v1',
+                kind: 'ResourceQuota',
+                metadata: {
+                    name: `${namespaceName}-default-quota`, // Naming convention
+                    namespace: namespaceName, // Namespace is needed here for kubectl context
+                },
+                spec: { hard: quotas }, // Assign the received quota object
+            };
+
+            try {
+                const quotaYaml = yaml.dump(quotaManifest);
+                console.log('[Debug] Applying ResourceQuota YAML:\n', quotaYaml);
+
+                // Execute kubectl apply -f -
+                const command = `kubectl apply -n ${namespaceName} -f -`;
+                quotaCreateOutput = await new Promise((resolve, reject) => {
+                    const process = exec(command, (error, stdout, stderr) => {
+                        if (error) {
+                            console.error(`kubectl apply error for quota in ${namespaceName}:`, stderr || error.message);
+                            reject(new Error(stderr || error.message));
+                            return;
+                        }
+                        console.log(`kubectl apply output for quota in ${namespaceName}:`, stdout);
+                        resolve(stdout);
+                    });
+                    // Pipe YAML to kubectl's stdin
+                    process.stdin.write(quotaYaml);
+                    process.stdin.end();
+                });
+                console.log(`ResourceQuota creation via kubectl likely succeeded for namespace '${namespaceName}'.`);
+
+            } catch (quotaErr) {
+                quotaCreateError = quotaErr.message || 'Failed to create ResourceQuota via kubectl';
+                console.error(`Error applying ResourceQuota YAML for namespace ${namespaceName}:`, quotaCreateError);
+            }
+        }
+
+        // Send success response based on namespace creation
+        const responseBody = {
+            namespace: namespaceCreateRes.body,
+            quotaStatus: quotaCreateError ? `Quota creation failed: ${quotaCreateError}` : (quotas ? `Quota applied via kubectl: ${quotaCreateOutput || 'OK'}` : 'No quota requested.')
+        };
+        res.status(201).json(responseBody);
+
+    } catch (err) {
+        // Handle errors during *namespace* creation
+        console.error(`Error creating namespace ${namespaceName}:`, err.response?.body || err.message || err);
+        const statusCode = err.response?.statusCode || 500; // 409 Conflict if it already exists
+        const errorDetails = err.response?.body?.message || err.message || 'Failed to create namespace';
+        res.status(statusCode).json({ error: 'Failed to create namespace', details: errorDetails });
+    }
+});

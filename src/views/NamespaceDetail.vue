@@ -186,8 +186,10 @@ const fetchResourceQuotas = async () => {
         if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
         const data = await response.json();
         resourceQuotas.value = data.items || [];
+        console.log('Fetched ResourceQuotas:', JSON.stringify(resourceQuotas.value, null, 2));
     } catch (err) {
         console.error("Error fetching resource quotas:", err);
+        resourceQuotas.value = [];
     } finally {
         loadingQuotas.value = false;
     }

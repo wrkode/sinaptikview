@@ -1,6 +1,14 @@
 <template>
   <div class="card">
-    <h2 class="text-2xl font-bold mb-4">Namespaces</h2>
+    <Toolbar class="mb-4">
+        <template #start>
+            <h2 class="text-2xl font-bold my-0">Namespaces</h2>
+        </template>
+
+        <template #end>
+            <Button label="Create Namespace" icon="pi pi-plus" @click="goToCreateNamespace" />
+        </template>
+    </Toolbar>
     
     <DataTable :value="namespaces" :loading="loading" tableStyle="min-width: 50rem">
       <template #empty> 
@@ -33,11 +41,15 @@
 </template>
 
 <script setup>
+import Button from 'primevue/button';
 import Column from 'primevue/column';
 import DataTable from 'primevue/datatable';
 import Tag from 'primevue/tag';
+import Toolbar from 'primevue/toolbar';
 import { onMounted, ref } from 'vue';
+import { useRouter } from 'vue-router';
 
+const router = useRouter();
 const namespaces = ref([]);
 const loading = ref(false);
 const error = ref(null);
@@ -90,6 +102,12 @@ const fetchNamespaces = async () => {
   } finally {
     loading.value = false;
   }
+};
+
+const goToCreateNamespace = () => {
+  // Implement the logic to navigate to the namespace creation page
+  console.log("Navigating to create namespace");
+  router.push({ name: 'namespace-create' });
 };
 
 onMounted(() => {
