@@ -92,7 +92,13 @@
             <Column header="Actions">
               <template #body="slotProps">
                 <Button icon="pi pi-align-justify" class="p-button-sm p-button-secondary mr-2" label="Logs" @click="showLogs(slotProps.data.name)" />
-                <Button icon="pi pi-terminal" class="p-button-sm p-button-secondary" label="Exec" @click="execInto(slotProps.data.name)" />
+                <Button 
+                  icon="pi pi-terminal" 
+                  class="p-button-sm p-button-secondary"
+                  label="Exec" 
+                  @click="openTerminalDialog(namespace, podName, slotProps.data.name)" 
+                  v-tooltip.bottom="'Exec into Container'"
+                />
               </template>
             </Column>
           </DataTable>
@@ -139,31 +145,65 @@
     <div v-else class="p-4">
       Pod not found.
     </div>
+
+    <!-- ADDED: Terminal Dialog -->
+    <Dialog 
+      v-model:visible="terminalDialogVisible" 
+      :header="`Terminal: ${terminalTarget.podName} / ${terminalTarget.containerName}`" 
+      :modal="true" 
+      :draggable="false"
+      position="top"
+      @hide="handleTerminalDialogClose"
+      style="width: 80vw; height: 70vh;"
+      contentStyle="padding: 0; height: calc(100% - 4rem); display: flex; flex-direction: column;"
+      :dismissableMask="true" 
+      :closable="true"
+      >
+        <WebTerminal 
+          v-if="terminalDialogVisible" 
+          :namespace="terminalTarget.namespace" 
+          :podName="terminalTarget.podName" 
+          :containerName="terminalTarget.containerName"
+          class="terminal-component"
+        />
+    </Dialog>
+
   </div>
 </template>
 
 <script setup>
+import WebTerminal from '@/components/WebTerminal.vue'; // Import the WebTerminal component
+import axios from 'axios';
 import yaml from 'js-yaml'; // Import js-yaml
 import Button from 'primevue/button';
 import Column from 'primevue/column';
 import DataTable from 'primevue/datatable';
+import Dialog from 'primevue/dialog'; // Added Dialog import
 import Message from 'primevue/message';
 import Panel from 'primevue/panel';
 import TabPanel from 'primevue/tabpanel';
 import TabView from 'primevue/tabview';
 import Tag from 'primevue/tag';
-import { computed, onMounted, ref } from 'vue';
+import Tooltip from 'primevue/tooltip'; // Added Tooltip import
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue';
 import { useRoute } from 'vue-router';
+
+// Directives
+const vTooltip = Tooltip; 
 
 const route = useRoute();
 const podName = computed(() => route.params.name);
 const namespace = computed(() => route.params.namespace);
-const podDetails = ref(null);
+const podDetails = shallowRef(null);
 const podEvents = ref([]);
 const podYaml = ref('');
-const loading = ref(false);
+const loading = ref(true); // Changed initial state to true
 const error = ref(null);
 const loadingEvents = ref(false);
+
+// Add state for Terminal Dialog
+const terminalDialogVisible = ref(false);
+const terminalTarget = ref({ namespace: '', podName: '', containerName: '' });
 
 const annotationCount = computed(() => podDetails.value?.metadata?.annotations ? Object.keys(podDetails.value.metadata.annotations).length : 0);
 
@@ -223,7 +263,7 @@ const getContainerState = (containerName) => {
 const getVolumeDetails = (volume) => {
     const details = { ...volume };
     delete details.name;
-    return details;
+    return details; // Return the object itself for <pre> tag
 }
 
 // Fetch Pod Details
@@ -245,7 +285,8 @@ const fetchPodDetails = async () => {
     } else {
         const data = await response.json();
         podDetails.value = data; 
-        podYaml.value = yaml.dump(data); // Generate YAML from fetched data
+        // Delay YAML generation until tab is clicked
+        // podYaml.value = yaml.dump(data); 
         fetchPodEvents(); // Fetch events after getting pod details (uses UID)
     }
   } catch (err) {
@@ -269,12 +310,9 @@ const fetchPodEvents = async () => {
     const fieldSelector = `involvedObject.uid=${podUID},involvedObject.namespace=${eventNamespace}`;
 
     try {
-        const response = await fetch(`/api/v1/namespaces/${encodeURIComponent(eventNamespace)}/events?fieldSelector=${encodeURIComponent(fieldSelector)}`);
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        const data = await response.json();
-        podEvents.value = data.items || [];
+        // Using axios now for consistency
+        const response = await axios.get(`/api/v1/namespaces/${encodeURIComponent(eventNamespace)}/events?fieldSelector=${encodeURIComponent(fieldSelector)}`);
+        podEvents.value = response.data.items || [];
         // Sort events by last timestamp descending
         podEvents.value.sort((a, b) => new Date(b.lastTimestamp) - new Date(a.lastTimestamp));
     } catch (err) {
@@ -285,26 +323,248 @@ const fetchPodEvents = async () => {
     }
 }
 
-// Placeholder functions for Logs/Exec
+// Placeholder function for Logs
 const showLogs = (containerName) => {
-    alert(`TODO: Show logs for container: ${containerName}`);
+    // TODO: Implement log viewing functionality
+    console.log(`TODO: Show logs for container: ${containerName} in pod ${podName.value}`);
+    alert(`Log viewing for ${containerName} is not yet implemented.`);
 }
-const execInto = (containerName) => {
-     alert(`TODO: Exec into container: ${containerName}`);
-}
+
+// *** Updated function to open the terminal dialog ***
+const openTerminalDialog = (targetNamespace, targetPodName, targetContainerName) => {
+  console.log(`Opening terminal for: ${targetNamespace}/${targetPodName}/${targetContainerName}`);
+  terminalTarget.value = { 
+    namespace: targetNamespace,
+    podName: targetPodName,
+    containerName: targetContainerName
+  };
+  terminalDialogVisible.value = true;
+};
+
+// Method to handle dialog close
+const handleTerminalDialogClose = () => {
+  console.log("Terminal dialog closed");
+  // Optional: Reset target when dialog closes to ensure clean state for next open
+  terminalTarget.value = { namespace: '', podName: '', containerName: '' };
+};
+
+// Handle tab change to load data lazily
+const onTabChange = (event) => {
+  const index = event.index;
+  activeTabIndex.value = index;
+  console.log(`Tab changed to index: ${index}`);
+  
+  if (index === 1 && !tabsLoaded.value[1]) { // Machines (Assuming this might be added later or was intended)
+    // fetchMachines(); // Placeholder if machines tab is added
+     tabsLoaded.value[1] = true;
+  }
+  else if (index === 2 && !tabsLoaded.value[2]) { // Containers Tab
+    // Containers are part of the main pod details, usually loaded already
+    tabsLoaded.value[2] = true; 
+  }
+   else if (index === 3 && !tabsLoaded.value[3]) { // Volumes Tab
+    tabsLoaded.value[3] = true; 
+  }
+  else if (index === 4 && !tabsLoaded.value[4]) { // Events Tab
+    fetchPodEvents(); // Events might need a refresh or initial load here
+    tabsLoaded.value[4] = true;
+  }
+  else if (index === 5 && !tabsLoaded.value[5]) { // YAML Tab
+    // Generate YAML when tab is first viewed
+    if (podDetails.value) {
+      try {
+        podYaml.value = yaml.dump(podDetails.value);
+      } catch(e) {
+        console.error("Error generating YAML:", e);
+        podYaml.value = "Error generating YAML.";
+      }
+    }
+    tabsLoaded.value[5] = true; 
+  }
+};
 
 onMounted(() => {
   fetchPodDetails();
 });
 
+// Cleanup on component destroy (e.g., clear intervals if any were used)
+onBeforeUnmount(() => {
+  // Add any cleanup logic if necessary
+});
+
 </script>
 
 <style scoped>
-pre {
-    background-color: #f5f5f5;
-    padding: 1em;
-    overflow-x: auto;
-    white-space: pre-wrap; 
-    word-wrap: break-word;
+.cluster-detail-view {
+  padding: 1rem;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
 }
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+  flex-shrink: 0;
+}
+
+.title-container {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.content {
+  flex: 1; 
+  overflow: auto; 
+  min-height: 0; 
+}
+
+.loading-container,
+.error-container,
+.not-found {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 300px;
+  gap: 1rem;
+  flex: 1; 
+}
+
+.error-container .p-button-sm {
+  margin-top: 0.5rem;
+}
+
+.overview-section, .machines-section, .pods-section, .yaml-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.metadata-panel, .conditions-panel {
+  background-color: var(--surface-card);
+  border-radius: 8px;
+  padding: 1.5rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+.metadata-panel h2, .conditions-panel h2 {
+  margin-top: 0;
+  margin-bottom: 1rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+  border-bottom: 1px solid var(--surface-border);
+  padding-bottom: 0.5rem;
+}
+
+.metadata-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); 
+  gap: 1rem 1.5rem; 
+}
+
+.metadata-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.metadata-label {
+  font-size: 0.875rem;
+  color: var(--text-color-secondary);
+  font-weight: 500;
+}
+
+.metadata-value {
+  font-size: 0.95rem;
+}
+
+.provider-value {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.provider-icon {
+  font-size: 1.2rem;
+}
+
+pre, .yaml-content {
+  background-color: var(--surface-ground); 
+  border: 1px solid var(--surface-border);
+  border-radius: 4px;
+  padding: 1em;
+  overflow-x: auto;
+  white-space: pre-wrap; 
+  word-wrap: break-word;
+  font-family: var(--font-family-monospace);
+  font-size: 0.875rem;
+  line-height: 1.6;
+  color: var(--text-color);
+  max-height: 600px; /* Limit height and allow scroll */
+}
+
+.loading-machines, .no-machines,
+.loading-pods, .no-pods {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem;
+  gap: 1rem;
+  color: var(--text-color-secondary);
+  min-height: 200px; 
+}
+
+.loading-machines i, .no-machines i,
+.loading-pods i, .no-pods i {
+  font-size: 2rem;
+}
+
+.container-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between; 
+  padding: 2px 0; 
+}
+
+.container-item span {
+  margin-right: 0.5rem; 
+  word-break: break-all; 
+}
+
+.terminal-component {
+  flex-grow: 1; 
+  min-height: 0; 
+}
+
+/* Adjust TabView panel padding */
+:deep(.p-tabview .p-tabview-panels) {
+  padding: 1.5rem 0 0 0; 
+}
+
+/* Adjust DataTable header style */
+:deep(.p-datatable .p-datatable-thead > tr > th) {
+  background-color: var(--surface-b); /* Lighter background for header */
+  color: var(--text-color);
+  font-weight: 600;
+}
+
+/* Ensure terminal dialog content area stretches */
+:deep(.p-dialog .p-dialog-content) {
+    padding: 0; /* Remove default padding */
+    height: 100%; /* Take full height passed from style */
+    display: flex;
+    flex-direction: column;
+}
+
 </style> 

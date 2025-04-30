@@ -1,6 +1,12 @@
 const express = require('express');
 const k8s = require('@kubernetes/client-node');
 const { exec } = require('child_process');
+const http = require('http'); // Import http module
+const WebSocket = require('ws'); // Import ws module
+const url = require('url'); // Import url module
+const stream = require('stream'); // Import stream module
+const pty = require('node-pty'); // Import node-pty
+const os = require('os'); // Required by node-pty
 
 const app = express();
 const port = 3001; // Port for the backend server
@@ -11,10 +17,9 @@ const kc = new k8s.KubeConfig();
 kc.loadFromDefault(); 
 
 const k8sApi = kc.makeApiClient(k8s.CoreV1Api);
-const k8sAppsApi = kc.makeApiClient(k8s.AppsV1Api); // Add AppsV1Api client
-
-// Import the CustomObjectsApi for CRDs like Cluster API resources
+const k8sAppsApi = kc.makeApiClient(k8s.AppsV1Api);
 const k8sCustomApi = kc.makeApiClient(k8s.CustomObjectsApi);
+const k8sExec = new k8s.Exec(kc); // Instantiate Exec class
 
 // Add a simple cache system
 const apiCache = {
@@ -920,13 +925,18 @@ app.get('/api/v1/secrets', async (req, res) => {
 app.get('/api/v1/namespaces/:namespace/secrets/:name', async (req, res) => {
     const secretName = req.params.name;
     const namespace = req.params.namespace;
+    const cacheKey = `secret:${namespace}:${secretName}`;
+    if (req.query.bypassCache !== 'true') {
+        const cachedData = apiCache.get(cacheKey);
+        if (cachedData) { console.log(`Cache hit for secret: ${namespace}/${secretName}`); return res.json(cachedData); }
+    }
     console.log(`Fetching details for Secret: ${secretName} in namespace: ${namespace}`);
     try {
-        const secretRes = await k8sApi.readNamespacedSecret({ name: secretName, namespace: namespace });
-        console.log(`Secret details response keys for ${namespace}/${secretName}:`, secretRes ? Object.keys(secretRes) : 'No response');
-        
-        if (secretRes) { 
-            res.json(secretRes);
+        const secretRes = await k8sApi.readNamespacedSecret(secretName, namespace);
+        console.log(`Secret details received for ${namespace}/${secretName}`);
+        if (secretRes?.body) { 
+            apiCache.set(cacheKey, secretRes.body);
+            res.json(secretRes.body);
         } else {
             console.error(`Secret details response object is missing for ${namespace}/${secretName}`, secretRes);
             res.status(500).json({ error: 'Failed to fetch Secret details', details: 'Backend received invalid response structure from Kubernetes API' });
@@ -1645,6 +1655,293 @@ app.get('/api/cluster-api/clusters/:namespace/:name/kubeconfig', async (req, res
   }
 });
 
-app.listen(port, () => {
-  console.log(`Backend server listening at http://localhost:${port}`);
-}); 
+// --- NEW: Pods for a specific Cluster API Cluster --- 
+app.get('/api/cluster-api/clusters/:namespace/:name/pods', async (req, res) => {
+  const clusterNamespace = req.params.namespace;
+  const clusterName = req.params.name;
+  const cacheKey = `cluster-pods:${clusterNamespace}:${clusterName}`;
+
+  // Simple cache check (can be improved)
+  const cachedData = apiCache.get(cacheKey);
+  if (cachedData && req.query.bypassCache !== 'true') {
+    console.log(`Cache hit for pods of cluster: ${clusterNamespace}/${clusterName}`);
+    return res.json(cachedData);
+  }
+
+  console.log(`Fetching pods for Cluster API cluster: ${clusterNamespace}/${clusterName}`);
+  try {
+    const labelSelector = `cluster.x-k8s.io/cluster-name=${clusterName}`;
+    // Fetch pods in the same namespace as the Cluster resource itself
+    const podsRes = await k8sApi.listNamespacedPod(clusterNamespace, undefined, undefined, undefined, undefined, labelSelector);
+    
+    console.log(`Pods response for cluster ${clusterNamespace}/${clusterName} (label: ${labelSelector}) received.`);
+
+    const responseData = { items: podsRes?.body?.items || [] };
+    apiCache.set(cacheKey, responseData, 15000); // Cache pods for 15 seconds
+    res.json(responseData);
+
+  } catch (err) {
+    console.error(`Error fetching pods for cluster ${clusterNamespace}/${clusterName}:`, err.message);
+    // Gracefully handle namespace not found
+    if (err.response && err.response.statusCode === 404 && err.body?.message?.includes('namespaces \"' + clusterNamespace + '\" not found')) {
+        console.warn(`Namespace ${clusterNamespace} not found when fetching pods for cluster ${clusterName}. Returning empty list.`);
+        res.json({ items: [] }); 
+    } else {
+        res.status(500).json({ error: 'Failed to fetch pods for cluster', details: err.message });
+    }
+  }
+});
+
+// --- Server Initialization --- 
+
+// Create HTTP server from Express app
+const server = http.createServer(app);
+
+// --- WebSocket Server Setup for Terminal --- 
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  const parsedUrl = url.parse(request.url, true);
+  const pathname = parsedUrl.pathname;
+  console.log(`[WebSocket Upgrade] Attempting upgrade for path: ${pathname}`);
+
+  // Regex to match the exec endpoint format: /api/pods/NAMESPACE/POD_NAME/exec?container=CONTAINER_NAME
+  const execPathRegex = /^\/api\/pods\/([^\/]+)\/([^\/]+)\/exec$/;
+  const match = pathname.match(execPathRegex);
+
+  if (match && parsedUrl.query.container) { // Ensure container name is present
+    console.log(`[WebSocket Upgrade] Path and query match exec pattern. Handling upgrade...`);
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      // Attach parsed query to request for easier access in 'connection' handler
+      request.query = parsedUrl.query; 
+      request.params = { namespace: match[1], podName: match[2] }; // Attach extracted params
+      wss.emit('connection', ws, request); // Emit connection event with the upgraded socket and request object
+    });
+  } else {
+    console.log(`[WebSocket Upgrade] Path ${pathname} or query params invalid for exec. Destroying socket.`);
+    socket.destroy();
+  }
+});
+
+// Handle new WebSocket connections for the terminal
+wss.on('connection', (ws, req) => {
+  let ptyProcess = null;
+  let connectionClosed = false;
+
+  // Determine shell based on OS
+  const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash'; // Use bash for non-windows
+
+  // Store target details for logging
+  let terminalTarget = { namespace: 'unknown', podName: 'unknown', containerName: 'unknown' };
+
+  const closeConnection = (reason = 'Connection closed') => {
+      if (connectionClosed) return;
+      connectionClosed = true;
+      const logNamespace = terminalTarget.namespace || 'unknown-ns';
+      const logPodName = terminalTarget.podName || 'unknown-pod';
+      const logContainerName = terminalTarget.containerName || 'unknown-container';
+      console.log(`[PTY Close] Closing connection for ${logNamespace}/${logPodName}/${logContainerName}. Reason: ${reason}`);
+
+      if (ptyProcess) {
+        try {
+          ptyProcess.kill();
+        } catch (e) {
+          console.warn(`[PTY Close] Error killing pty process: ${e.message}`);
+        }
+        ptyProcess = null;
+      }
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          try { ws.close(1000, reason); } catch(e) { console.warn("[WebSocket Close] Error closing client WebSocket:", e.message); }
+      }
+      ws.removeAllListeners();
+  };
+
+  try {
+    const parsedUrl = url.parse(req.url, true);
+    const pathname = parsedUrl.pathname;
+    const execPathRegex = /^\/api\/pods\/([^\/]+)\/([^\/]+)\/exec$/; // Regex for path matching
+    const match = pathname.match(execPathRegex);
+
+    if (!match) throw new Error('Invalid path for PTY');
+
+    const namespace = match[1];
+    const podName = match[2];
+    const containerName = parsedUrl.query.container;
+    // Default to 'sh' for the command to execute inside the pod
+    const commandToExecute = parsedUrl.query.command || 'sh';
+
+    terminalTarget = { namespace, podName, containerName };
+
+    if (!namespace || !podName || !containerName) throw new Error('Missing required parameters');
+
+    console.log(`[PTY Connection] Starting PTY for: ns=${namespace}, pod=${podName}, container=${containerName}, cmd=${commandToExecute}`);
+
+    // Define kubectl command arguments
+    const args = [
+        'exec',
+        '-i', // interactive
+        '-t', // allocate a TTY
+        '-n', namespace,
+        podName,
+        '--container', containerName,
+        '--', // End of kubectl flags, start of command
+        commandToExecute
+    ];
+
+    // Spawn the pseudo-terminal with kubectl exec
+    ptyProcess = pty.spawn('kubectl', args, {
+      name: 'xterm-color',
+      cols: 80, // Initial size, will be resized
+      rows: 24,
+      cwd: process.env.HOME, // Or appropriate working directory
+      env: process.env
+    });
+
+    console.log(`[PTY Connection] PTY process spawned for ${namespace}/${podName} (PID: ${ptyProcess.pid})`);
+
+    // Handle data from PTY (-> WebSocket)
+    ptyProcess.onData(data => {
+      if (!connectionClosed && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(data);
+        } catch (e) {
+          console.error(`[PTY Error] Failed sending PTY data to client for ${namespace}/${podName}: `, e);
+        }
+      }
+    });
+
+    // Handle PTY exit
+    ptyProcess.onExit(({ exitCode, signal }) => {
+      const reason = `PTY process exited (Code: ${exitCode}, Signal: ${signal})`;
+      console.log(`[PTY Exit] ${reason} for ${namespace}/${podName}`);
+      closeConnection(reason);
+    });
+
+    // Handle data from WebSocket (-> PTY)
+    ws.on('message', message => {
+      if (connectionClosed || !ptyProcess) return;
+
+      // --- Enhanced Logging ---
+      const messageType = typeof message;
+      const isBuffer = Buffer.isBuffer(message);
+      console.log(`[WS->PTY Debug] Received message. Type: ${messageType}, Is Buffer: ${isBuffer}`);
+      if (isBuffer) {
+          console.log(`[WS->PTY Debug] Buffer content (hex): ${message.toString('hex')}`);
+          try {
+              console.log(`[WS->PTY Debug] Buffer decoded as UTF-8: "${message.toString('utf-8')}"`);
+          } catch (decodeError) { /* ignore */}
+      } else if (messageType === 'string') {
+           console.log(`[WS->PTY Debug] String content: "${message}"`);
+      }
+      // --- End Enhanced Logging ---
+
+      try {
+        // Attempt to handle as string first (client *should* send string)
+        if (typeof message === 'string' && message.length > 0) {
+          const channel = message[0];
+          const data = message.substring(1);
+
+          if (channel === '0') { // Input data
+            // console.log(`[WS->PTY Input] Writing string: ${data}`);
+            ptyProcess.write(data);
+          } else if (channel === '4') { // Resize command
+            try {
+                // Match client format: 4{"Width": cols, "Height": rows}
+                const { Width, Height } = JSON.parse(data);
+                if (Number.isInteger(Width) && Number.isInteger(Height) && Width > 0 && Height > 0) {
+                    console.log(`[PTY Resize] Resizing PTY (from string) for ${namespace}/${podName} to ${Width}x${Height}`);
+                    ptyProcess.resize(Width, Height);
+                } else {
+                     console.warn(`[PTY Resize] Invalid Width/Height received (string): ${data}`);
+                }
+            } catch (parseError) {
+                console.warn(`[PTY Resize] Failed to parse resize message JSON (string): ${data}`, parseError);
+                 // Don't write malformed resize message to PTY
+            }
+          } else {
+            console.warn(`[WS->PTY] Received message on unknown string channel: ${channel}`);
+            // Optionally write unexpected channel data? Best not to by default.
+            // ptyProcess.write(message);
+          }
+        } else if (Buffer.isBuffer(message)) {
+           // Handle if message unexpectedly arrives as Buffer
+           console.log("[WS->PTY] Received buffer, attempting decode...");
+           try {
+               const decodedString = message.toString('utf-8');
+               if (decodedString.length > 0) {
+                   const channel = decodedString[0];
+                   const data = decodedString.substring(1);
+
+                   if (channel === '0') { // Input data decoded from buffer
+                       console.log(`[WS->PTY Input] Writing decoded buffer: ${data}`);
+                       ptyProcess.write(data);
+                   } else if (channel === '4') { // Resize command decoded from buffer
+                       try {
+                           const { Width, Height } = JSON.parse(data);
+                           if (Number.isInteger(Width) && Number.isInteger(Height) && Width > 0 && Height > 0) {
+                               console.log(`[PTY Resize] Resizing PTY (from buffer) for ${namespace}/${podName} to ${Width}x${Height}`);
+                               ptyProcess.resize(Width, Height);
+                           } else {
+                                console.warn(`[PTY Resize] Invalid Width/Height received (buffer): ${data}`);
+                           }
+                       } catch (parseError) {
+                           console.warn(`[PTY Resize] Failed to parse resize message JSON (buffer): ${data}`, parseError);
+                           // If decode/parse as resize fails, write the original buffer as input
+                           console.log("[WS->PTY] Writing original buffer to PTY as fallback.");
+                           ptyProcess.write(message);
+                       }
+                   } else {
+                       console.warn(`[WS->PTY] Decoded buffer, unknown channel: ${channel}. Writing original buffer.`);
+                       ptyProcess.write(message); // Write original buffer if channel unknown
+                   }
+               } else {
+                    console.log("[WS->PTY] Received empty buffer or decode failed, writing original buffer.");
+                    ptyProcess.write(message); // Write original buffer if decode fails/empty
+               }
+           } catch (decodeError) {
+                console.error(`[WS->PTY] Error decoding buffer: ${decodeError}. Writing original buffer.`);
+                ptyProcess.write(message); // Write original buffer on decode error
+           }
+        } else {
+          console.warn("[WS->PTY] Received unexpected message type:", typeof message);
+        }
+
+      } catch (e) {
+        console.error(`[PTY Error] Error writing message to PTY for ${namespace}/${podName}:`, e);
+      }
+    });
+
+    // Handle WebSocket close
+    ws.on('close', (code, reason) => {
+      const reasonStr = reason?.toString() || 'Client closed WebSocket';
+      console.log(`[WebSocket Client Close] Disconnected for ${namespace}/${podName}. Code: ${code}, Reason: ${reasonStr}`);
+      closeConnection(reasonStr);
+    });
+
+    // Handle WebSocket error
+    ws.on('error', error => {
+      console.error(`[WebSocket Client Error] Error for ${namespace}/${podName}:`, error);
+      closeConnection(`Client WS Error: ${error.message}`);
+    });
+
+  } catch (err) {
+    console.error(`[PTY Connection] Error during setup for ${req?.url}:`, err);
+    // Ensure closeConnection is called if setup fails
+    closeConnection(`Failed to start PTY session: ${err.message}`);
+  } 
+});
+
+
+// --- Start Server --- 
+server.listen(port, () => {
+  console.log(`Backend server with WebSocket support listening at http://localhost:${port}`);
+});
+
+
+// --- Utility / Fallback Functions --- 
+// (Keep existing execKubectl if needed elsewhere)
+const execKubectlOriginal = (command) => {
+  // ... existing implementation ...
+};
+// Ensure the old app.listen is removed if it exists, as server.listen is now used
+// app.listen(port, () => { ... });
