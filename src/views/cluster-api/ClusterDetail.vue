@@ -114,6 +114,56 @@
           </div>
         </TabPanel>
         
+        <TabPanel header="Pods">
+          <div class="pods-section">
+            <DataTable 
+              :value="pods" 
+              :loading="loadingPods"
+              stripedRows
+              v-if="pods.length > 0"
+              responsiveLayout="scroll"
+            >
+              <Column field="metadata.name" header="Name" />
+              <Column field="metadata.namespace" header="Namespace" />
+              <Column field="status.phase" header="Status">
+                <template #body="{ data }">
+                  <StatusBadge :status="data.status?.phase || 'Unknown'" />
+                </template>
+              </Column>
+              <Column field="status.podIP" header="Pod IP" />
+              <Column field="spec.nodeName" header="Node" />
+              <Column header="Containers">
+                 <template #body="{ data }">
+                    <div v-for="container in data.spec.containers" :key="container.name" class="container-item">
+                       <span>{{ container.name }}</span>
+                       <Button 
+                          icon="pi pi-terminal" 
+                          class="p-button-rounded p-button-text p-button-sm"
+                          @click="openTerminalDialog(data.metadata.namespace, data.metadata.name, container.name)"
+                          v-tooltip.bottom="'Open Terminal'"
+                       />
+                    </div>
+                 </template>
+              </Column>
+               <Column field="metadata.creationTimestamp" header="Created">
+                <template #body="{ data }">
+                  {{ formatDate(data.metadata?.creationTimestamp) }}
+                </template>
+              </Column>
+            </DataTable>
+            
+            <div v-else-if="loadingPods" class="loading-pods">
+              <i class="pi pi-spin pi-spinner"></i>
+              <span>Loading pods...</span>
+            </div>
+            
+            <div v-else class="no-pods">
+              <i class="pi pi-info-circle"></i>
+              <span>No pods found for this cluster (or associated namespace).</span>
+            </div>
+          </div>
+        </TabPanel>
+        
         <TabPanel header="YAML">
           <div class="yaml-section">
             <pre class="yaml-content">{{ clusterYaml }}</pre>
@@ -125,6 +175,27 @@
     <div v-else class="not-found">
       <Message severity="warn">Cluster data not found.</Message>
     </div>
+
+    <!-- Terminal Dialog -->
+    <Dialog 
+      v-model:visible="terminalDialogVisible" 
+      :header="`Terminal: ${terminalTarget.podName} / ${terminalTarget.containerName}`" 
+      :modal="true" 
+      :draggable="false"
+      position="top"
+      @hide="handleTerminalDialogClose"
+      style="width: 80vw; height: 70vh;"
+      contentStyle="padding: 0; height: calc(100% - 4rem); display: flex; flex-direction: column;"
+      >
+        <WebTerminal 
+          v-if="terminalDialogVisible" 
+          :namespace="terminalTarget.namespace" 
+          :podName="terminalTarget.podName" 
+          :containerName="terminalTarget.containerName"
+          class="terminal-component"
+        />
+    </Dialog>
+
   </div>
 </template>
 
@@ -137,12 +208,14 @@ import { useRoute } from 'vue-router';
 import Button from 'primevue/button';
 import Column from 'primevue/column';
 import DataTable from 'primevue/datatable';
+import Dialog from 'primevue/dialog';
 import Message from 'primevue/message';
 import ProgressSpinner from 'primevue/progressspinner';
 import TabPanel from 'primevue/tabpanel';
 import TabView from 'primevue/tabview';
 
 import StatusBadge from '@/components/cluster-api/StatusBadge.vue';
+import WebTerminal from '@/components/WebTerminal.vue';
 
 // Get route params
 const route = useRoute();
@@ -160,12 +233,14 @@ const activeTabIndex = ref(0);
 const tabsLoaded = ref({
   0: false, // Overview tab
   1: false, // Machines tab
-  2: false  // YAML tab
+  2: false, // Pods tab
+  3: false  // YAML tab
 });
 
 // Cache keys
 const clusterCacheKey = `cluster:${namespace}:${name}`;
 const machinesCacheKey = `machines:${namespace}:${name}`;
+const podsCacheKey = `pods:${namespace}:${name}`;
 
 // Computed properties
 const clusterName = computed(() => {
@@ -178,7 +253,7 @@ const infrastructureProvider = computed(() => {
 
 // Lazily compute YAML (show JSON for now)
 const clusterYaml = computed(() => {
-  if (!cluster.value || activeTabIndex.value !== 2 || !tabsLoaded.value[2]) return 'Loading YAML...';
+  if (!cluster.value || activeTabIndex.value !== 3 || !tabsLoaded.value[3]) return 'Loading YAML...';
   try {
     return JSON.stringify(cluster.value, null, 2); 
   } catch (err) {
@@ -186,6 +261,14 @@ const clusterYaml = computed(() => {
     return "Error displaying cluster data.";
   }
 });
+
+// Add state for Pods
+const pods = shallowRef([]);
+const loadingPods = ref(false);
+
+// Add state for Terminal Dialog
+const terminalDialogVisible = ref(false);
+const terminalTarget = ref({ namespace: '', podName: '', containerName: '' });
 
 // Methods
 const fetchClusterData = async () => {
@@ -199,7 +282,8 @@ const fetchClusterData = async () => {
       loading.value = false;
       tabsLoaded.value[0] = true;
       if (activeTabIndex.value === 1) fetchMachines();
-      if (activeTabIndex.value === 2) tabsLoaded.value[2] = true; // Mark YAML as loaded if viewing cached data
+      if (activeTabIndex.value === 2) fetchPods();
+      if (activeTabIndex.value === 3) tabsLoaded.value[3] = true;
       return;
     }
     
@@ -208,7 +292,8 @@ const fetchClusterData = async () => {
     cacheService.set(clusterCacheKey, response.data, 60000);
     tabsLoaded.value[0] = true;
     if (activeTabIndex.value === 1) fetchMachines();
-    if (activeTabIndex.value === 2) tabsLoaded.value[2] = true; // Mark YAML as loaded
+    if (activeTabIndex.value === 2) fetchPods();
+    if (activeTabIndex.value === 3) tabsLoaded.value[3] = true;
 
   } catch (err) {
     console.error('Error fetching cluster details:', err);
@@ -244,6 +329,40 @@ const fetchMachines = async () => {
   }
 };
 
+// New method to fetch Pods
+const fetchPods = async () => {
+  if (tabsLoaded.value[2]) return; // Already loaded
+  if (!cluster.value) return; // Need cluster info
+
+  console.log(`Fetching pods for cluster ${namespace}/${name}`);
+  loadingPods.value = true;
+  try {
+    // NOTE: This endpoint needs to be created on the backend!
+    // It needs to list pods relevant to this cluster 
+    // (e.g., by label selector derived from the cluster or in its namespace)
+    const podNamespace = cluster.value.metadata?.namespace || namespace; // Use cluster's namespace if available
+    
+    // --- Option 1: Fetch pods for the cluster's namespace --- 
+    // const response = await axios.get(`/api/pods?namespace=${podNamespace}`);
+    
+    // --- Option 2: Fetch pods specifically linked to the cluster (backend needs logic) ---
+    const response = await axios.get(`/api/cluster-api/clusters/${namespace}/${name}/pods`);
+
+    // Check if response.data exists and has an items property
+    pods.value = response.data?.items || []; 
+    tabsLoaded.value[2] = true;
+    // Optional: Cache pod data if appropriate
+    // cacheService.set(podsCacheKey, pods.value, 30000);
+
+  } catch (err) {
+    console.error('Error fetching pods:', err);
+    pods.value = [];
+    // Optionally show pod-specific error
+  } finally {
+    loadingPods.value = false;
+  }
+};
+
 // Handle tab change to lazy load content
 const onTabChange = (index) => {
   console.log(`Tab changed to index: ${index}`);
@@ -254,8 +373,11 @@ const onTabChange = (index) => {
     fetchMachines();
   }
   else if (index === 2 && !tabsLoaded.value[2]) {
+    fetchPods();
+  }
+  else if (index === 3 && !tabsLoaded.value[3]) {
     // Mark YAML tab as loaded; computation is handled by computed property
-    tabsLoaded.value[2] = true; 
+    tabsLoaded.value[3] = true; 
   }
 };
 
@@ -277,6 +399,24 @@ const getProviderIcon = (provider) => {
   if (providerLower.includes('vsphere')) return 'pi pi-desktop';
   // Add other providers as needed
   return 'pi pi-cloud';
+};
+
+// Method to open the terminal dialog
+const openTerminalDialog = (targetNamespace, targetPodName, targetContainerName) => {
+  console.log(`Opening terminal for: ${targetNamespace}/${targetPodName}/${targetContainerName}`);
+  terminalTarget.value = { 
+    namespace: targetNamespace,
+    podName: targetPodName,
+    containerName: targetContainerName
+  };
+  terminalDialogVisible.value = true;
+};
+
+// Method to handle dialog close (optional cleanup)
+const handleTerminalDialogClose = () => {
+  console.log("Terminal dialog closed");
+  // Reset target if needed
+  // terminalTarget.value = { namespace: '', podName: '', containerName: '' };
 };
 
 // Lifecycle hooks
@@ -423,6 +563,43 @@ onBeforeUnmount(() => {
 
 .loading-machines i, .no-machines i {
   font-size: 2rem;
+}
+
+.pods-section {
+  /* Styles for pods section if needed */
+}
+
+.loading-pods, .no-pods {
+  /* Styles similar to loading/no-machines */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem;
+  gap: 1rem;
+  color: var(--text-color-secondary);
+  min-height: 200px; 
+}
+
+.loading-pods i, .no-pods i {
+  font-size: 2rem;
+}
+
+.container-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between; /* Space out name and button */
+  padding: 2px 0; /* Add some vertical spacing */
+}
+
+.container-item span {
+  margin-right: 0.5rem; /* Space between name and button */
+  word-break: break-all; /* Break long container names */
+}
+
+.terminal-component {
+  flex-grow: 1; /* Allow terminal to fill dialog content area */
+  min-height: 0; /* Important for flex item height */
 }
 
 /* Deep selectors might be needed if PrimeVue components encapsulate styles */
