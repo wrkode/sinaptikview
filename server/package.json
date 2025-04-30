@@ -12,6 +12,7 @@
   "dependencies": {
     "@kubernetes/client-node": "^1.0.0",
     "express": "^5.1.0",
+    "js-yaml": "^4.1.0",
     "node-pty": "^1.0.0"
   }
 }
